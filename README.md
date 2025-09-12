@@ -1,1 +1,1 @@
-# Motion Correction of Spinalcord Diffusion MRI using Deep Learning
+# Motion Correction of Spinal Cord Diffusion MRI using Deep Learning
