@@ -55,32 +55,30 @@ with torch.no_grad():
         moving = batch["moving"].to(device)
         fixed = batch["fixed"].to(device)
 
-        warped_all, flows_4d, (dx, dy, dz) = model(moving, fixed)
+        warped_all, flows_4d = model(moving, fixed)
 
-        B, C, D, H, W, T = warped_all.shape
+        B, C, H, W, D, T = warped_all.shape
         sample_dice_scores = []
 
         for t in range(T):
-            warped_t = warped_all[..., t]  # (B,1,D,H,W)
+            warped_t = warped_all[..., t]  # (B,1,H,W,D)
 
             if "moving_label" in batch and "fixed_label" in batch:
-                moving_lbl = batch["moving_label"].to(device).float()  # (B,1,D,H,W)
+                moving_lbl = batch["moving_label"].to(device).float()  # (B,1,H,W,D)
                 fixed_lbl = batch["fixed_label"].to(device).float()
 
-                flow_t = flows_4d[..., t]  # (B,3,D,H,W)
+                flow_t = flows_4d[..., t]  # (B,3,H,W,D)
                 warped_lbl_t = label_warper(moving_lbl, flow_t)
 
-                # ensure exact match before Dice
                 if warped_lbl_t.shape != fixed_lbl.shape:
                     warped_lbl_t = F.interpolate(
                         warped_lbl_t, size=fixed_lbl.shape[2:], mode="nearest"
                     )
                 dice = dice_metric(warped_lbl_t, fixed_lbl).item()
 
-
             else:
-                warped_bin = (warped_t > 0.5).float()  # (B,1,D,H,W)
-                fixed_bin = (fixed > 0.5).float()  # (B,1,D,H,W)
+                warped_bin = (warped_t > 0.5).float()
+                fixed_bin = (fixed > 0.5).float()
                 if warped_bin.shape != fixed_bin.shape:
                     warped_bin = F.interpolate(
                         warped_bin, size=fixed_bin.shape[2:], mode="nearest"
@@ -90,28 +88,19 @@ with torch.no_grad():
             sample_dice_scores.append(dice)
             print(f"[{i}] Volume {t}: DICE = {dice:.4f}")
 
-        # Mean DICE for this sample
         mean_dice_sample = np.mean(sample_dice_scores)
         all_sample_means.append(mean_dice_sample)
         print(f"[{i}] Mean DICE (sample): {mean_dice_sample:.4f}")
 
-        # -----------------------------
-        # Save results to original subfolder
-        # -----------------------------
-        if "moving_path" not in batch:
-            raise KeyError("Your DataGenerator must return 'moving_path' in each batch.")
-
         moving_path = batch["moving_path"][0]
         save_dir = os.path.dirname(moving_path)
         prefix = os.path.basename(os.path.dirname(save_dir))
-
         affine = nib.load(moving_path).affine.astype(np.float64)
 
-        # Explicit squeezes (avoid dropping spatial dims by accident)
-        warped_np = warped_all.squeeze(0).squeeze(0).cpu().numpy()  # (D,H,W,T)
-        dx_np = dx.squeeze(0).squeeze(0).cpu().numpy()
-        dy_np = dy.squeeze(0).squeeze(0).cpu().numpy()
-        dz_np = dz.squeeze(0).squeeze(0).cpu().numpy()
+        warped_np = warped_all.squeeze(0).squeeze(0).cpu().numpy()  # (H,W,D,T)
+        dx_np = flows_4d[:, 0].squeeze(0).cpu().numpy()             # (H,W,D,T)
+        dy_np = flows_4d[:, 1].squeeze(0).cpu().numpy()
+        dz_np = flows_4d[:, 2].squeeze(0).cpu().numpy()
 
         nib.save(nib.Nifti1Image(warped_np, affine), os.path.join(save_dir, f"{prefix}_moco.nii.gz"))
         nib.save(nib.Nifti1Image(dx_np, affine), os.path.join(save_dir, f"{prefix}_dx.nii.gz"))
@@ -152,6 +141,7 @@ for i in range(len(test_loader.dataset)):
     dice_csv_path = os.path.join(save_dir, f"{prefix}_dice_scores.csv")
     df = pd.read_csv(dice_csv_path)
 
+    # Extract per-volume DICE (still one scalar per volume)
     volume_dice = df[df["volume"] != "mean"]["dice"].astype(float).tolist()
     volume_dice.append(df[df["volume"] == "mean"]["dice"].values[0])
     dice_data[prefix] = volume_dice
@@ -163,10 +153,10 @@ row_labels = [str(v) for v in range(max_vols - 1)] + ["mean"]
 df_result = pd.DataFrame(index=row_labels)
 
 for case, scores in dice_data.items():
-    padded_scores = scores + [np.nan] * (max_vols - len(scores))  # pad if needed
+    padded_scores = scores + [np.nan] * (max_vols - len(scores))
     df_result[case] = padded_scores
 
-# Save final table
+# Save final summary table
 testing_dir = os.path.join(base_path, "sourcedata")
 csv_out = os.path.join(testing_dir, "testing", f"{order_execution}_dice_summary_volume_wise.csv")
 df_result.index.name = "volume"
