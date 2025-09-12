@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Created on Mon Sep 1 2025
-
 @author: Nontharat Tucksinapinunchai
 """
 
@@ -25,7 +24,6 @@ from monai.data import load_decathlon_datalist
 from monai.data import DataLoader,Dataset
 from monai.networks.nets import VoxelMorphUNet
 from monai.networks.blocks import Warp
-from datetime import datetime
 
 start_time = time.ctime()
 print("Start at:", start_time)
@@ -58,19 +56,19 @@ class DataGenerator(Dataset):
         moving_path = sample["moving"]
         fixed_path = sample["fixed"]
 
-        # moving: nib -> (X,Y,Z,T). To torch -> (1, D, H, W, T) ??
+        # Moving: nib -> (H, W, D, T)
         moving_img = nib.load(moving_path)
-        moving_img = nib.as_closest_canonical(moving_img)  # enforce RAS orientation
-        moving_np = moving_img.get_fdata()
+        moving_img = nib.as_closest_canonical(moving_img)
+        moving_np = moving_img.get_fdata()  # (H,W,D,T)
         moving_np = self.normalize_volume(moving_np)
-        moving = torch.from_numpy(moving_np.astype(np.float32)).permute(2, 1, 0, 3).unsqueeze(0)
+        moving = torch.from_numpy(moving_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D,T)
 
-        # fixed: nib -> (X,Y,Z). To torch -> (1, D, H, W)
+        # Fixed: nib -> (H, W, D)
         fixed_img = nib.load(fixed_path)
-        fixed_img = nib.as_closest_canonical(fixed_img)  # enforce RAS orientation
-        fixed_np = fixed_img.get_fdata()
+        fixed_img = nib.as_closest_canonical(fixed_img)
+        fixed_np = fixed_img.get_fdata()  # (H,W,D)
         fixed_np = self.normalize_volume(fixed_np)
-        fixed = torch.from_numpy(fixed_np.astype(np.float32)).permute(2, 1, 0).unsqueeze(0)
+        fixed = torch.from_numpy(fixed_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D)
 
         torch.cuda.empty_cache()
         return {"moving": moving, "fixed": fixed, "moving_path": moving_path, "fixed_path": fixed_path}
@@ -112,24 +110,24 @@ class DataModule(pl.LightningDataModule):
 # Smoothness regularization
 # -----------------------------
 def gradient_loss(flow_5d: torch.Tensor) -> torch.Tensor:
-    # flow_5d: (B, 3, D, H, W)
-    dz = torch.abs(flow_5d[:, :, 1:, :, :] - flow_5d[:, :, :-1, :, :])  # along D
-    dy = torch.abs(flow_5d[:, :, :, 1:, :] - flow_5d[:, :, :, :-1, :])  # along H
-    dx = torch.abs(flow_5d[:, :, :, :, 1:] - flow_5d[:, :, :, :, :-1])  # along W
+    # flow_5d: (B, 3, H, W, D)
+    dz = torch.abs(flow_5d[:, :, :, :, 1:] - flow_5d[:, :, :, :, :-1])  # along D
+    dy = torch.abs(flow_5d[:, :, :, 1:, :] - flow_5d[:, :, :, :-1, :])  # along W
+    dx = torch.abs(flow_5d[:, :, 1:, :, :] - flow_5d[:, :, :-1, :, :])  # along H
 
-    dz = F.pad(dz, (0, 0, 0, 0, 0, 1))
+    dz = F.pad(dz, (0, 1, 0, 0, 0, 0))
     dy = F.pad(dy, (0, 0, 0, 1, 0, 0))
-    dx = F.pad(dx, (0, 1, 0, 0, 0, 0))
-    return torch.mean(dx ** 2 + dy ** 2 + dz ** 2)
+    dx = F.pad(dx, (0, 0, 0, 0, 0, 1))
+    return torch.mean(dx**2 + dy**2 + dz**2)
 
 # -----------------------------
 # L2 loss (MSE)
 # -----------------------------
 def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor) -> torch.Tensor:
-    # warped_all: (B, 1, D, H, W, T)
-    B, C, D, H, W, T = warped_all.shape
-    if fixed.shape[2:] != (D, H, W):
-        fixed = F.interpolate(fixed, size=(D, H, W), mode="trilinear", align_corners=False)
+    # warped_all: (B,1,H,W,D,T)
+    B, C, H, W, D, T = warped_all.shape
+    if fixed.shape[2:] != (H, W, D):
+        fixed = F.interpolate(fixed, size=(H, W, D), mode="trilinear", align_corners=False)
 
     def norm01(x, eps=1e-6):
         x_cpu = x.detach().cpu().numpy()
@@ -138,30 +136,28 @@ def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor) -> torch.Tensor:
         x = (x - vmin) / (vmax - vmin + eps)
         return x
 
-    fixed_n = norm01(fixed)
-    warped_n = norm01(warped_all)
-    fixed_T = fixed_n[..., None].expand(-1, -1, D, H, W, T)
-    return F.mse_loss(warped_n, fixed_T)
+    fixed_n = norm01(fixed)  # (B,1,H,W,D)
+    warped_n = norm01(warped_all)  # (B,1,H,W,D,T)
+    fixed_T = fixed_n[..., None].expand(-1, -1, H, W, D, T)
+
+    return F.mse_loss(torch.from_numpy(warped_n).float(), torch.from_numpy(fixed_T).float())
 
 # -----------------------------
 # Global Normalized Cross-Correlation
 # -----------------------------
 def global_ncc(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    # Make sure shapes are the same
     if a.shape != b.shape:
         b = b.expand_as(a)
 
-    # Remove mean
     a_mean = a.mean(dim=(2, 3, 4), keepdim=True)
     b_mean = b.mean(dim=(2, 3, 4), keepdim=True)
     a = a - a_mean
     b = b - b_mean
 
-    # Numerator and denominator
     num = (a * b).mean(dim=(2, 3, 4), keepdim=True)
-    den = torch.sqrt((a**2).mean(dim=(2, 3, 4), keepdim=True) * (b**2).mean(dim=(2, 3, 4), keepdim=True)) + eps
-
-    # Return negative NCC (since we minimize loss)
+    den = torch.sqrt(
+        (a**2).mean(dim=(2, 3, 4), keepdim=True) * (b**2).mean(dim=(2, 3, 4), keepdim=True)
+    ) + eps
     return -(num / den).mean()
 
 # -----------------------------
@@ -193,60 +189,51 @@ class VoxelMorphReg(pl.LightningModule):
 
     def forward(self, moving, fixed):
         """
-        moving: (B, 1, D, H, W, T)
-        fixed:  (B, 1, D, H, W)
+        moving: (B, 1, H, W, D, T)
+        fixed:  (B, 1, H, W, D)
         returns:
-          warped_all:     (B, 1, D*, H*, W*, T)
-          flows_4d:       (B, 3, D*, H*, W*, T)
-          (dx, dy, dz):   each (B, 1, D*, H*, W*, T)
+          warped_all:     (B, 1, H*, W*, D*, T)
+          flows_4d:       (B, 3, H*, W*, D*, T)
+          (dx, dy, dz):   each (B, 1, H*, W*, D*, T)
         """
-        B, C, D, H, W, T = moving.shape
+        B, C, H, W, D, T = moving.shape
 
         # Make sizes UNet-friendly
-        target_D = power(D, 32)
         target_H = power(H, 32)
         target_W = power(W, 32)
+        target_D = power(D, 32)
 
         # Pre-resize fixed once
-        fixed_res = F.interpolate(fixed, size=(target_D, target_H, target_W),
+        fixed_res = F.interpolate(fixed, size=(target_H, target_W, target_D),
                                   mode="trilinear", align_corners=False)
 
         warped_list = []
         flow_list = []
 
         for t in range(T):
-            # (B, 1, D, H, W)
-            moving_t = moving[..., t]
-            moving_t_res = F.interpolate(moving_t, size=(target_D, target_H, target_W),
+            moving_t = moving[..., t]  # (B,1,H,W,D)
+            moving_t_res = F.interpolate(moving_t, size=(target_H, target_W, target_D),
                                          mode="trilinear", align_corners=False)
 
-            x = torch.cat([moving_t_res, fixed_res], dim=1)  # (B, 2, D, H, W)
+            x = torch.cat([moving_t_res, fixed_res], dim=1)  # (B,2,H,W,D)
+            flow = self.unet(x)  # (B,3,H,W,D)
+            warped = self.transformer(moving_t_res, flow)  # (B,1,H,W,D)
 
-            flow = self.unet(x)  # (B, 3, D*, H*, W*)
-            warped = self.transformer(moving_t_res, flow)  # (B, 1, D*, H*, W*)
+            warped_list.append(warped)
+            flow_list.append(flow)
 
-            warped_list.append(warped)      # each (B,1,D*,H*,W*)
-            flow_list.append(flow)          # each (B,3,D*,H*,W*)
+        warped_all = torch.stack(warped_list, dim=-1)  # (B,1,H*,W*,D*,T)
+        flows_4d = torch.stack(flow_list, dim=-1)  # (B,3,H*,W*,D*,T)
 
-        # Stack along time dimension
-        warped_all = torch.stack(warped_list, dim=-1)  # (B,1,D*,H*,W*,T)
-        flows_4d   = torch.stack(flow_list,  dim=-1)   # (B,3,D*,H*,W*,T)
-
-        dx = flows_4d[:, 0:1, ...]
-        dy = flows_4d[:, 1:2, ...]
-        dz = flows_4d[:, 2:3, ...]
-
-        return warped_all, flows_4d, (dx, dy, dz)
+        return warped_all, flows_4d
 
     def training_step(self, batch, batch_idx):
         moving, fixed = batch["moving"], batch["fixed"]
-        warped_all, flows_4d, _ = self(moving, fixed)
+        warped_all, flows_4d = self(moving, fixed)
 
-        B, _, D, H, W, T = warped_all.shape
-
-        if fixed.shape[2:] != (D, H, W):
-            fixed = F.interpolate(fixed, size=(D, H, W), mode="trilinear", align_corners=False)
-
+        B, _, H, W, D, T = warped_all.shape
+        if fixed.shape[2:] != (H, W, D):
+            fixed = F.interpolate(fixed, size=(H, W, D), mode="trilinear", align_corners=False)
         # Expand fixed across time
         fixed_T = fixed.unsqueeze(-1).expand_as(warped_all)
 
@@ -254,7 +241,7 @@ class VoxelMorphReg(pl.LightningModule):
         loss_ncc = global_ncc(warped_all, fixed_T)
         loss_sim = 0.25 * loss_l2 + 0.75 * loss_ncc
 
-        flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, D, H, W)
+        flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, H, W, D)
         loss_smooth = gradient_loss(flows_bt)
 
         loss = loss_sim + self.lambda_smooth * loss_smooth
@@ -270,13 +257,11 @@ class VoxelMorphReg(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         moving, fixed = batch["moving"], batch["fixed"]
-        warped_all, flows_4d, _ = self(moving, fixed)
+        warped_all, flows_4d = self(moving, fixed)
 
-        B, _, D, H, W, T = warped_all.shape
-
-        if fixed.shape[2:] != (D, H, W):
-            fixed = F.interpolate(fixed, size=(D, H, W), mode="trilinear", align_corners=False)
-
+        B, _, H, W, D, T = warped_all.shape
+        if fixed.shape[2:] != (H, W, D):
+            fixed = F.interpolate(fixed, size=(H, W, D), mode="trilinear", align_corners=False)
         # Expand fixed across time
         fixed_T = fixed.unsqueeze(-1).expand_as(warped_all)
 
@@ -284,15 +269,15 @@ class VoxelMorphReg(pl.LightningModule):
         loss_ncc = global_ncc(warped_all, fixed_T)
         loss_sim = 0.25 * loss_l2 + 0.75 * loss_ncc
 
-        flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, D, H, W)
+        flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, H, W, D)
         loss_smooth = gradient_loss(flows_bt)
 
         loss = loss_sim + self.lambda_smooth * loss_smooth
 
         self.log("val_loss", loss, prog_bar=True)
-        self.log("train_l2_loss", loss_l2)
-        self.log("train_ncc_loss", loss_ncc)
-        self.log("train_sim_loss", loss_sim)
+        self.log("val_l2_loss", loss_l2)
+        self.log("val_ncc_loss", loss_ncc)
+        self.log("val_sim_loss", loss_sim)
         self.log("val_smooth_loss", loss_smooth)
 
         torch.cuda.empty_cache()
@@ -300,9 +285,8 @@ class VoxelMorphReg(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.lr)
-        # Reduce LR when val_loss plateaus
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=10, verbose=True
+            optimizer, mode="min", factor=0.5, patience=15, verbose=True
         )
         return {
             "optimizer": optimizer,
@@ -310,8 +294,8 @@ class VoxelMorphReg(pl.LightningModule):
                 "scheduler": scheduler,
                 "monitor": "val_loss",
                 "interval": "epoch",
-                "frequency": 1
-            }
+                "frequency": 1,
+            },
         }
 
 # -----------------------------
