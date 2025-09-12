@@ -1,1 +1,1 @@
-# moco_dmri
+# Motion Correction of Spinalcord Diffusion MRI using Deep Learning
