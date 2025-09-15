@@ -43,8 +43,6 @@ model.eval()
 test_loader = dm.test_dataloader()
 dice_metric = DiceMetric(include_background=True, reduction="mean")
 
-label_warper = Warp(mode="nearest", padding_mode="border").to(device)
-
 # -----------------------------
 # Run inference & compute/save
 # -----------------------------
@@ -52,53 +50,51 @@ all_sample_means = []
 
 with torch.no_grad():
     for i, batch in enumerate(test_loader):
-        moving = batch["moving"].to(device)
-        fixed = batch["fixed"].to(device)
+        moving = batch["moving"].to(device)  # (B,1,H,W,D,T)
+        fixed = batch["fixed"].to(device)    # (B,1,H,W,D)
 
         warped_all, flows_4d = model(moving, fixed)
-
         B, C, H, W, D, T = warped_all.shape
-        sample_dice_scores = []
+
+        sample_dice_before, sample_dice_after = [], []
 
         for t in range(T):
             warped_t = warped_all[..., t]  # (B,1,H,W,D)
 
-            if "moving_label" in batch and "fixed_label" in batch:
-                moving_lbl = batch["moving_label"].to(device).float()  # (B,1,H,W,D)
-                fixed_lbl = batch["fixed_label"].to(device).float()
+            # --- BEFORE warp ---
+            moving_bin = (moving[..., t] > 0.5).float()  # (B,1,H,W,D)
+            fixed_bin = (fixed > 0.5).float()
+            dice_before = dice_metric(moving_bin, fixed_bin).item()
 
-                flow_t = flows_4d[..., t]  # (B,3,H,W,D)
-                warped_lbl_t = label_warper(moving_lbl, flow_t)
+            # --- AFTER warp ---
+            warped_bin = (warped_t > 0.5).float()
+            dice_after = dice_metric(warped_bin, fixed_bin).item()
 
-                if warped_lbl_t.shape != fixed_lbl.shape:
-                    warped_lbl_t = F.interpolate(
-                        warped_lbl_t, size=fixed_lbl.shape[2:], mode="nearest"
-                    )
-                dice = dice_metric(warped_lbl_t, fixed_lbl).item()
+            sample_dice_before.append(dice_before)
+            sample_dice_after.append(dice_after)
 
-            else:
-                warped_bin = (warped_t > 0.5).float()
-                fixed_bin = (fixed > 0.5).float()
-                if warped_bin.shape != fixed_bin.shape:
-                    warped_bin = F.interpolate(
-                        warped_bin, size=fixed_bin.shape[2:], mode="nearest"
-                    )
-                dice = dice_metric(warped_bin, fixed_bin).item()
+            print(f"[{i}] Volume {t}: DICE BEFORE = {dice_before:.4f}, AFTER = {dice_after:.4f}")
 
-            sample_dice_scores.append(dice)
-            print(f"[{i}] Volume {t}: DICE = {dice:.4f}")
+        mean_dice_before = np.mean(sample_dice_before)
+        mean_dice_after = np.mean(sample_dice_after)
+        all_sample_means.append(mean_dice_after)
 
-        mean_dice_sample = np.mean(sample_dice_scores)
-        all_sample_means.append(mean_dice_sample)
-        print(f"[{i}] Mean DICE (sample): {mean_dice_sample:.4f}")
+        print(f"[{i}] Mean DICE (sample): BEFORE = {mean_dice_before:.4f}, AFTER = {mean_dice_after:.4f}")
 
+        # -----------------------------
+        # Save warped images & flows
+        # -----------------------------
         moving_path = batch["moving_path"][0]
         save_dir = os.path.dirname(moving_path)
         prefix = os.path.basename(os.path.dirname(save_dir))
-        affine = nib.load(moving_path).affine.astype(np.float64)
+
+        # Ensure affine is RAS (consistent with DataGenerator)
+        src_img = nib.load(moving_path)
+        src_img = nib.as_closest_canonical(src_img)
+        affine = src_img.affine.astype(np.float64)
 
         warped_np = warped_all.squeeze(0).squeeze(0).cpu().numpy()  # (H,W,D,T)
-        dx_np = flows_4d[:, 0].squeeze(0).cpu().numpy()             # (H,W,D,T)
+        dx_np = flows_4d[:, 0].squeeze(0).cpu().numpy()
         dy_np = flows_4d[:, 1].squeeze(0).cpu().numpy()
         dz_np = flows_4d[:, 2].squeeze(0).cpu().numpy()
 
@@ -110,27 +106,21 @@ with torch.no_grad():
         print(f"[{i}] Saved outputs to: {save_dir}")
 
         # -----------------------------
-        # Save DICE scores to CSV
+        # Save per-case DICE scores
         # -----------------------------
         dice_csv_path = os.path.join(save_dir, f"{prefix}_dice_scores.csv")
         with open(dice_csv_path, "w") as f:
-            f.write("volume,dice\n")
-            for t, d in enumerate(sample_dice_scores):
-                f.write(f"{t},{d:.6f}\n")
-            f.write(f"mean,{mean_dice_sample:.6f}\n")
+            f.write("volume,dice_before,dice_after\n")
+            for t, (db, da) in enumerate(zip(sample_dice_before, sample_dice_after)):
+                f.write(f"{t},{db:.6f},{da:.6f}\n")
+            f.write(f"mean,{mean_dice_before:.6f},{mean_dice_after:.6f}\n")
 
         print(f"[{i}] Saved DICE to: {dice_csv_path}")
 
 # -----------------------------
-# Print final mean DICE
+# Final Excel Summary (3 sheets)
 # -----------------------------
-final_mean_dice = np.mean(all_sample_means)
-print(f"Mean DICE over {len(all_sample_means)} samples: {final_mean_dice:.4f}")
-
-# -----------------------------
-# Accumulate DICE tables in wide format (volume x case)
-# -----------------------------
-dice_data = {}
+dice_data_before, dice_data_after = {}, {}
 max_vols = 0
 
 for i in range(len(test_loader.dataset)):
@@ -141,24 +131,43 @@ for i in range(len(test_loader.dataset)):
     dice_csv_path = os.path.join(save_dir, f"{prefix}_dice_scores.csv")
     df = pd.read_csv(dice_csv_path)
 
-    # Extract per-volume DICE (still one scalar per volume)
-    volume_dice = df[df["volume"] != "mean"]["dice"].astype(float).tolist()
-    volume_dice.append(df[df["volume"] == "mean"]["dice"].values[0])
-    dice_data[prefix] = volume_dice
+    volume_dice_before = df[df["volume"] != "mean"]["dice_before"].astype(float).tolist()
+    volume_dice_before.append(df[df["volume"] == "mean"]["dice_before"].values[0])
 
-    max_vols = max(max_vols, len(volume_dice))
+    volume_dice_after = df[df["volume"] != "mean"]["dice_after"].astype(float).tolist()
+    volume_dice_after.append(df[df["volume"] == "mean"]["dice_after"].values[0])
 
-# Create DataFrame: rows = volumes + mean, columns = cases
+    dice_data_before[prefix] = volume_dice_before
+    dice_data_after[prefix] = volume_dice_after
+    max_vols = max(max_vols, len(volume_dice_before))
+
 row_labels = [str(v) for v in range(max_vols - 1)] + ["mean"]
-df_result = pd.DataFrame(index=row_labels)
+df_before, df_after, df_improve = pd.DataFrame(index=row_labels), pd.DataFrame(index=row_labels), pd.DataFrame(index=row_labels)
 
-for case, scores in dice_data.items():
-    padded_scores = scores + [np.nan] * (max_vols - len(scores))
-    df_result[case] = padded_scores
+eps = 1e-8
+for case in dice_data_before:
+    padded_before = dice_data_before[case] + [np.nan] * (max_vols - len(dice_data_before[case]))
+    padded_after = dice_data_after[case] + [np.nan] * (max_vols - len(dice_data_after[case]))
 
-# Save final summary table
+    df_before[case] = padded_before
+    df_after[case] = padded_after
+
+    arr_before = np.array(padded_before, dtype=float)
+    arr_after = np.array(padded_after, dtype=float)
+    improvement = (arr_after - arr_before) / (arr_before + eps) * 100
+    df_improve[case] = improvement
+
 testing_dir = os.path.join(base_path, "sourcedata")
-csv_out = os.path.join(testing_dir, "testing", f"{order_execution}_dice_summary_volume_wise.csv")
-df_result.index.name = "volume"
-df_result.to_csv(csv_out)
-print(f"Saved volume-wise wide DICE table to: {csv_out}")
+excel_out = os.path.join(testing_dir, "testing", f"{order_execution}_dice_summary.xlsx")
+
+with pd.ExcelWriter(excel_out, engine="openpyxl") as writer:
+    df_before.index.name = "volume"
+    df_before.to_excel(writer, sheet_name="before")
+
+    df_after.index.name = "volume"
+    df_after.to_excel(writer, sheet_name="after")
+
+    df_improve.index.name = "volume"
+    df_improve.to_excel(writer, sheet_name="%improvement")
+
+print(f"Saved final summary Excel to: {excel_out} (sheets: before, after, improvement_%)")

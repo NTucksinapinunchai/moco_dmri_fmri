@@ -44,12 +44,6 @@ class DataGenerator(Dataset):
     def __len__(self):
         return len(self.file_list)
 
-    def normalize_volume(self, vol: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-        vmin = np.percentile(vol, 1)
-        vmax = np.percentile(vol, 99)
-        vol = np.clip(vol, vmin, vmax)
-        return (vol - vmin) / (vmax - vmin + eps)
-
     def __getitem__(self, idx):
         sample = self.file_list[idx]
 
@@ -60,14 +54,12 @@ class DataGenerator(Dataset):
         moving_img = nib.load(moving_path)
         moving_img = nib.as_closest_canonical(moving_img)
         moving_np = moving_img.get_fdata()  # (H,W,D,T)
-        moving_np = self.normalize_volume(moving_np)
         moving = torch.from_numpy(moving_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D,T)
 
         # Fixed: nib -> (H, W, D)
         fixed_img = nib.load(fixed_path)
         fixed_img = nib.as_closest_canonical(fixed_img)
         fixed_np = fixed_img.get_fdata()  # (H,W,D)
-        fixed_np = self.normalize_volume(fixed_np)
         fixed = torch.from_numpy(fixed_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D)
 
         torch.cuda.empty_cache()
@@ -124,7 +116,6 @@ def gradient_loss(flow_5d: torch.Tensor) -> torch.Tensor:
 # L2 loss (MSE)
 # -----------------------------
 def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor) -> torch.Tensor:
-    # warped_all: (B,1,H,W,D,T)
     B, C, H, W, D, T = warped_all.shape
     if fixed.shape[2:] != (H, W, D):
         fixed = F.interpolate(fixed, size=(H, W, D), mode="trilinear", align_corners=False)
@@ -133,15 +124,14 @@ def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor) -> torch.Tensor:
         x_cpu = x.detach().cpu().numpy()
         vmin = np.percentile(x_cpu, 1)
         vmax = np.percentile(x_cpu, 99)
-        x = (x - vmin) / (vmax - vmin + eps)
-        return x
+        x_cpu = (x_cpu - vmin) / (vmax - vmin + eps)
+        return torch.from_numpy(x_cpu).to(x.device, dtype=x.dtype)
 
-    fixed_n = norm01(fixed)  # (B,1,H,W,D)
-    warped_n = norm01(warped_all)  # (B,1,H,W,D,T)
+    fixed_n = norm01(fixed)            # (B,1,H,W,D)
+    warped_n = norm01(warped_all)      # (B,1,H,W,D,T)
     fixed_T = fixed_n[..., None].expand(-1, -1, H, W, D, T)
 
-    return F.mse_loss(torch.from_numpy(warped_n).float(), torch.from_numpy(fixed_T).float())
-
+    return F.mse_loss(warped_n, fixed_T)
 # -----------------------------
 # Global Normalized Cross-Correlation
 # -----------------------------
@@ -163,8 +153,41 @@ def global_ncc(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> torch.Ten
 # -----------------------------
 # Some helper function
 # -----------------------------
-def power(x, n=32):
+def next_multiple(x, n=32):
     return ((int(x) + n - 1) // n) * n
+
+def compute_padding(H, W, D, n=32):
+    Hn, Wn, Dn = next_multiple(H, n), next_multiple(W, n), next_multiple(D, n)
+    ph, pw, pd = Hn - H, Wn - W, Dn - D
+    # For (B,C,H,W,D): pad order is (D_left,D_right, W_left,W_right, H_left,H_right)
+    pad = (0, pd, 0, pw, 0, ph)
+    return pad, (ph, pw, pd)
+
+def pad_moving(moving, pad):
+    # moving: (B,1,H,W,D,T)
+    B,C,H,W,D,T = moving.shape
+    padded_list = []
+    for t in range(T):
+        mov_t = moving[..., t]                # (B,1,H,W,D)
+        mov_t_pad = F.pad(mov_t, pad)         # (B,1,Hp,Wp,Dp)
+        padded_list.append(mov_t_pad)
+    return torch.stack(padded_list, dim=-1)   # (B,1,Hp,Wp,Dp,T)
+
+
+def unpad_5d(x, phpwpd):
+    ph, pw, pd = phpwpd
+    H, W, D = x.shape[2], x.shape[3], x.shape[4]
+    return x[:, :, 0:H-ph if ph else H,
+                   0:W-pw if pw else W,
+                   0:D-pd if pd else D]
+
+def normalize_volume(x, eps: float = 1e-6):
+    x_cpu = x.detach().cpu().numpy()   # NumPy-based normalization, safe conversion
+    vmin = np.percentile(x_cpu, 1)
+    vmax = np.percentile(x_cpu, 99)
+    x_cpu = np.clip(x_cpu, vmin, vmax)
+    x_cpu = (x_cpu - vmin) / (vmax - vmin + eps)
+    return torch.from_numpy(x_cpu).to(x.device, dtype=x.dtype)
 
 # -----------------------------
 # LightningModule
@@ -189,43 +212,47 @@ class VoxelMorphReg(pl.LightningModule):
 
     def forward(self, moving, fixed):
         """
-        moving: (B, 1, H, W, D, T)
-        fixed:  (B, 1, H, W, D)
+        moving: (B, 1, H, W, D, T)              # RAW (H,W,D ordering)
+        fixed:  (B, 1, H, W, D)                 # RAW
         returns:
-          warped_all:     (B, 1, H*, W*, D*, T)
-          flows_4d:       (B, 3, H*, W*, D*, T)
-          (dx, dy, dz):   each (B, 1, H*, W*, D*, T)
+          warped_all_raw: (B, 1, H, W, D, T)    # raw intensities preserved
+          flows_4d:       (B, 3, H, W, D, T)
         """
         B, C, H, W, D, T = moving.shape
 
-        # Make sizes UNet-friendly
-        target_H = power(H, 32)
-        target_W = power(W, 32)
-        target_D = power(D, 32)
+        # ---- Padding to multiples of 32 ----
+        pad, phpwpd = compute_padding(H, W, D, n=32)
+        fixed_raw_pad = F.pad(fixed, pad)  # (B,1,Hp,Wp,Dp)
+        moving_raw_pad = pad_moving(moving, pad)  # (B,1,Hp,Wp,Dp,T)
 
-        # Pre-resize fixed once
-        fixed_res = F.interpolate(fixed, size=(target_H, target_W, target_D),
-                                  mode="trilinear", align_corners=False)
+        # ---- Normalize padded tensors (for flow prediction only) ----
+        fixed_norm_pad = normalize_volume(fixed_raw_pad)
+        moving_norm_pad = normalize_volume(moving_raw_pad)
 
-        warped_list = []
-        flow_list = []
+        warped_list, flow_list = [], []
 
         for t in range(T):
-            moving_t = moving[..., t]  # (B,1,H,W,D)
-            moving_t_res = F.interpolate(moving_t, size=(target_H, target_W, target_D),
-                                         mode="trilinear", align_corners=False)
+            # Take one timepoint, both raw and normalized
+            mov_t_raw = moving_raw_pad[..., t]  # (B,1,Hp,Wp,Dp)
+            mov_t_norm = moving_norm_pad[..., t]  # (B,1,Hp,Wp,Dp)
 
-            x = torch.cat([moving_t_res, fixed_res], dim=1)  # (B,2,H,W,D)
-            flow = self.unet(x)  # (B,3,H,W,D)
-            warped = self.transformer(moving_t_res, flow)  # (B,1,H,W,D)
+            # Concatenate normalized moving + fixed for UNet input
+            x = torch.cat([mov_t_norm, fixed_norm_pad], dim=1)  # (B,2,Hp,Wp,Dp)
+            flow = self.unet(x)  # (B,3,Hp,Wp,Dp)
 
-            warped_list.append(warped)
+            # Warp the RAW (not normalized) moving slice
+            warped_raw = self.transformer(mov_t_raw, flow)  # (B,1,Hp,Wp,Dp)
+
+            # ---- Unpad back to original size ----
+            warped_raw = unpad_5d(warped_raw, phpwpd)  # (B,1,H,W,D)
+            flow = unpad_5d(flow, phpwpd)  # (B,3,H,W,D)
+
+            warped_list.append(warped_raw)
             flow_list.append(flow)
 
-        warped_all = torch.stack(warped_list, dim=-1)  # (B,1,H*,W*,D*,T)
-        flows_4d = torch.stack(flow_list, dim=-1)  # (B,3,H*,W*,D*,T)
-
-        return warped_all, flows_4d
+        warped_all_raw = torch.stack(warped_list, dim=-1)  # (B,1,H,W,D,T)
+        flows_4d = torch.stack(flow_list, dim=-1)  # (B,3,H,W,D,T)
+        return warped_all_raw, flows_4d
 
     def training_step(self, batch, batch_idx):
         moving, fixed = batch["moving"], batch["fixed"]
@@ -302,7 +329,7 @@ class VoxelMorphReg(pl.LightningModule):
 # logger (Weights & Biases)
 # -----------------------------
 order_execution = sys.argv[1]
-num_epochs = 25
+num_epochs = 30
 batch_size = 1
 lr = 1e-4
 lambda_smooth = 50
@@ -361,7 +388,6 @@ if __name__ == "__main__":
         "data_path": data_path
     })
     dm = DataModule(json_path=json_path, batch_size=batch_size, num_workers=num_workers)
-    model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth)
     trainer = pl.Trainer(
         max_epochs=num_epochs,
         logger=wandb_logger,
