@@ -49,21 +49,29 @@ class DataGenerator(Dataset):
 
         moving_path = sample["moving"]
         fixed_path = sample["fixed"]
+        mask_path = sample["mask"]
 
-        # Moving: nib -> (H, W, D, T)
+        # Moving: (H, W, D, T)
         moving_img = nib.load(moving_path)
         moving_img = nib.as_closest_canonical(moving_img)
-        moving_np = moving_img.get_fdata()  # (H,W,D,T)
+        moving_np = moving_img.get_fdata()
         moving = torch.from_numpy(moving_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D,T)
 
-        # Fixed: nib -> (H, W, D)
+        # Fixed: (H, W, D, T)
         fixed_img = nib.load(fixed_path)
         fixed_img = nib.as_closest_canonical(fixed_img)
-        fixed_np = fixed_img.get_fdata()  # (H,W,D)
-        fixed = torch.from_numpy(fixed_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D)
+        fixed_np = fixed_img.get_fdata()
+        fixed = torch.from_numpy(fixed_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D,T)
+
+        # Mask: (H, W, D)
+        mask_img = nib.load(mask_path)
+        mask_img = nib.as_closest_canonical(mask_img)
+        mask_np = mask_img.get_fdata()
+        mask = torch.from_numpy(mask_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D)
 
         torch.cuda.empty_cache()
-        return {"moving": moving, "fixed": fixed, "moving_path": moving_path, "fixed_path": fixed_path}
+        return {"moving": moving, "fixed": fixed, "mask": mask,
+                "moving_path": moving_path, "fixed_path": fixed_path, "mask_path": mask_path}
 
 # -----------------------------
 # DataModule
@@ -115,40 +123,94 @@ def gradient_loss(flow_5d: torch.Tensor) -> torch.Tensor:
 # -----------------------------
 # L2 loss (MSE)
 # -----------------------------
-def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor) -> torch.Tensor:
+def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     B, C, H, W, D, T = warped_all.shape
-    if fixed.shape[2:] != (H, W, D):
-        fixed = F.interpolate(fixed, size=(H, W, D), mode="trilinear", align_corners=False)
+    losses = []
+    for t in range(T):
+        warped_t = warped_all[..., t]   # (B,1,H,W,D)
+        fixed_t = fixed[..., t]         # (B,1,H,W,D)
+        mask_t = mask                   # (B,1,H,W,D)
 
-    def norm01(x, eps=1e-6):
-        x_cpu = x.detach().cpu().numpy()
-        vmin = np.percentile(x_cpu, 1)
-        vmax = np.percentile(x_cpu, 99)
-        x_cpu = (x_cpu - vmin) / (vmax - vmin + eps)
-        return torch.from_numpy(x_cpu).to(x.device, dtype=x.dtype)
+        warped_n = normalize_volume(warped_t)
+        fixed_n = normalize_volume(fixed_t)
 
-    fixed_n = norm01(fixed)            # (B,1,H,W,D)
-    warped_n = norm01(warped_all)      # (B,1,H,W,D,T)
-    fixed_T = fixed_n[..., None].expand(-1, -1, H, W, D, T)
+        warped_masked = warped_n * mask_t
+        fixed_masked = fixed_n * mask_t
 
-    return F.mse_loss(warped_n, fixed_T)
+        losses.append(F.mse_loss(warped_masked, fixed_masked))
+
+    return torch.stack(losses).mean()
+
+# # -----------------------------
+# # Global Normalized Cross-Correlation (GNCC)
+# # -----------------------------
+# def global_ncc(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+#     B, C, H, W, D, T = a.shape
+#     ncc_vals = []
+#
+#     for t in range(T):
+#         a_t = normalize_volume(a[..., t])
+#         b_t = normalize_volume(b[..., t])
+#         m_t = mask
+#
+#         a_t = a_t * m_t
+#         b_t = b_t * m_t
+#
+#         a_mean = a_t.mean(dim=(2, 3, 4), keepdim=True)
+#         b_mean = b_t.mean(dim=(2, 3, 4), keepdim=True)
+#         a_t = a_t - a_mean
+#         b_t = b_t - b_mean
+#
+#         num = (a_t * b_t).mean(dim=(2, 3, 4), keepdim=True)
+#         den = torch.sqrt(
+#             (a_t ** 2).mean(dim=(2, 3, 4), keepdim=True) *
+#             (b_t ** 2).mean(dim=(2, 3, 4), keepdim=True)
+#         ) + eps
+#         ncc_vals.append(-(num / den).mean())
+#
+#     return torch.stack(ncc_vals).mean()
+
 # -----------------------------
-# Global Normalized Cross-Correlation
+# Local Normalized Cross-Correlation (LNCC) over timepoints.
 # -----------------------------
-def global_ncc(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    if a.shape != b.shape:
-        b = b.expand_as(a)
+def local_ncc(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, win_size: int = 9, eps: float = 1e-6) -> torch.Tensor:
+    B, C, H, W, D, T = a.shape
+    ncc_vals = []
 
-    a_mean = a.mean(dim=(2, 3, 4), keepdim=True)
-    b_mean = b.mean(dim=(2, 3, 4), keepdim=True)
-    a = a - a_mean
-    b = b - b_mean
+    # convolution filter for local sums
+    sum_filt = torch.ones(1, 1, win_size, win_size, win_size, device=a.device, dtype=a.dtype)
+    win_vol = win_size ** 3
+    pad = win_size // 2
 
-    num = (a * b).mean(dim=(2, 3, 4), keepdim=True)
-    den = torch.sqrt(
-        (a**2).mean(dim=(2, 3, 4), keepdim=True) * (b**2).mean(dim=(2, 3, 4), keepdim=True)
-    ) + eps
-    return -(num / den).mean()
+    for t in range(T):
+        a_t = a[..., t] * mask
+        b_t = b[..., t] * mask
+
+        # reshape to (B,1,H,W,D) for conv3d
+        a_t = a_t.view(B, 1, H, W, D)
+        b_t = b_t.view(B, 1, H, W, D)
+
+        # local sums
+        I_sum = F.conv3d(a_t, sum_filt, padding=pad)
+        J_sum = F.conv3d(b_t, sum_filt, padding=pad)
+
+        I2_sum = F.conv3d(a_t * a_t, sum_filt, padding=pad)
+        J2_sum = F.conv3d(b_t * b_t, sum_filt, padding=pad)
+        IJ_sum = F.conv3d(a_t * b_t, sum_filt, padding=pad)
+
+        # means
+        u_I = I_sum / win_vol
+        u_J = J_sum / win_vol
+
+        # cross terms
+        cross = IJ_sum - u_J * I_sum - u_I * J_sum + u_I * u_J * win_vol
+        I_var = I2_sum - 2 * u_I * I_sum + u_I * u_I * win_vol
+        J_var = J2_sum - 2 * u_J * J_sum + u_J * u_J * win_vol
+
+        ncc = (cross * cross) / (I_var * J_var + eps)
+        ncc_vals.append(-ncc.mean())
+
+    return torch.stack(ncc_vals).mean()
 
 # -----------------------------
 # Some helper function
@@ -181,19 +243,34 @@ def unpad_5d(x, phpwpd):
                    0:W-pw if pw else W,
                    0:D-pd if pd else D]
 
-def normalize_volume(x, eps: float = 1e-6):
-    x_cpu = x.detach().cpu().numpy()   # NumPy-based normalization, safe conversion
-    vmin = np.percentile(x_cpu, 1)
-    vmax = np.percentile(x_cpu, 99)
-    x_cpu = np.clip(x_cpu, vmin, vmax)
-    x_cpu = (x_cpu - vmin) / (vmax - vmin + eps)
-    return torch.from_numpy(x_cpu).to(x.device, dtype=x.dtype)
+# def normalize_volume(x, eps: float = 1e-6):
+#     x_cpu = x.detach().cpu().numpy()   # NumPy-based normalization, safe conversion
+#     vmin = np.percentile(x_cpu, 1)
+#     vmax = np.percentile(x_cpu, 99)
+#     x_cpu = np.clip(x_cpu, vmin, vmax)
+#     x_cpu = (x_cpu - vmin) / (vmax - vmin + eps)
+#     return torch.from_numpy(x_cpu).to(x.device, dtype=x.dtype)
+
+def normalize_volume(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # Flatten spatial dims → (B, C, N)
+    flat = x.flatten(start_dim=2)
+
+    # Compute per-sample percentiles (1% and 99%)
+    vmin = torch.quantile(flat, 0.01, dim=-1, keepdim=True)
+    vmax = torch.quantile(flat, 0.99, dim=-1, keepdim=True)
+
+    vmin = vmin.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+    vmax = vmax.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+
+    # Clip and scale
+    x = torch.clamp(x, vmin, vmax)
+    return (x - vmin) / (vmax - vmin + eps)
 
 # -----------------------------
 # LightningModule
 # -----------------------------
 class VoxelMorphReg(pl.LightningModule):
-    def __init__(self, lr=1e-4, lambda_smooth=50):
+    def __init__(self, lr=1e-4, lambda_smooth=1):
         super().__init__()
         self.lr = lr
         self.lambda_smooth = lambda_smooth
@@ -210,10 +287,11 @@ class VoxelMorphReg(pl.LightningModule):
         # Use border padding to reduce black edge artifacts
         self.transformer = Warp(mode="bilinear", padding_mode="border")
 
-    def forward(self, moving, fixed):
+    def forward(self, moving, fixed, mask):
         """
         moving: (B, 1, H, W, D, T)              # RAW (H,W,D ordering)
-        fixed:  (B, 1, H, W, D)                 # RAW
+        fixed:  (B, 1, H, W, D, T)              # RAW
+        mask:  (B, 1, H, W, D)
         returns:
           warped_all_raw: (B, 1, H, W, D, T)    # raw intensities preserved
           flows_4d:       (B, 3, H, W, D, T)
@@ -222,52 +300,52 @@ class VoxelMorphReg(pl.LightningModule):
 
         # ---- Padding to multiples of 32 ----
         pad, phpwpd = compute_padding(H, W, D, n=32)
-        fixed_raw_pad = F.pad(fixed, pad)  # (B,1,Hp,Wp,Dp)
-        moving_raw_pad = pad_moving(moving, pad)  # (B,1,Hp,Wp,Dp,T)
-
-        # ---- Normalize padded tensors (for flow prediction only) ----
-        fixed_norm_pad = normalize_volume(fixed_raw_pad)
-        moving_norm_pad = normalize_volume(moving_raw_pad)
+        fixed_pad = F.pad(fixed[..., 0], pad).unsqueeze(-1)  # pick one T since fixed is identical across T
+        moving_pad = pad_moving(moving, pad)
+        mask_pad = F.pad(mask, pad)
+        mask_pad_bin = (mask_pad > 0.5).float()
 
         warped_list, flow_list = [], []
 
         for t in range(T):
-            # Take one timepoint, both raw and normalized
-            mov_t_raw = moving_raw_pad[..., t]  # (B,1,Hp,Wp,Dp)
-            mov_t_norm = moving_norm_pad[..., t]  # (B,1,Hp,Wp,Dp)
+            mov_t_raw = moving_pad[..., t]  # (B,1,Hp,Wp,Dp)
+            fix_t_raw = fixed_pad[..., 0]  # (B,1,Hp,Wp,Dp)
 
-            # Concatenate normalized moving + fixed for UNet input
-            x = torch.cat([mov_t_norm, fixed_norm_pad], dim=1)  # (B,2,Hp,Wp,Dp)
-            flow = self.unet(x)  # (B,3,Hp,Wp,Dp)
+            # ---- Normalize per timepoint ----
+            mov_t_norm = normalize_volume(mov_t_raw)
+            fix_t_norm = normalize_volume(fix_t_raw)
 
-            # Warp the RAW (not normalized) moving slice
-            warped_raw = self.transformer(mov_t_raw, flow)  # (B,1,Hp,Wp,Dp)
+            # Masked inputs
+            mov_t_norm = mov_t_norm * mask_pad_bin
+            fix_t_norm = fix_t_norm * mask_pad_bin
 
-            # ---- Unpad back to original size ----
-            warped_raw = unpad_5d(warped_raw, phpwpd)  # (B,1,H,W,D)
-            flow = unpad_5d(flow, phpwpd)  # (B,3,H,W,D)
+            # UNet input
+            x = torch.cat([mov_t_norm, fix_t_norm], dim=1)  # (B,2,Hp,Wp,Dp)
+            flow = self.unet(x)
+
+            # Warp raw moving (not normalized!)
+            warped_raw = self.transformer(mov_t_raw, flow)
+
+            # ---- Unpad ----
+            warped_raw = unpad_5d(warped_raw, phpwpd)
+            flow = unpad_5d(flow, phpwpd)
 
             warped_list.append(warped_raw)
             flow_list.append(flow)
 
-        warped_all_raw = torch.stack(warped_list, dim=-1)  # (B,1,H,W,D,T)
-        flows_4d = torch.stack(flow_list, dim=-1)  # (B,3,H,W,D,T)
+        warped_all_raw = torch.stack(warped_list, dim=-1)   # (B,1,H,W,D,T)
+        flows_4d = torch.stack(flow_list, dim=-1)           # (B,3,H,W,D,T)
         return warped_all_raw, flows_4d
 
     def training_step(self, batch, batch_idx):
-        moving, fixed = batch["moving"], batch["fixed"]
-        warped_all, flows_4d = self(moving, fixed)
+        moving, fixed, mask = batch["moving"], batch["fixed"], batch["mask"]
+        warped_all, flows_4d = self(moving, fixed, mask)
 
-        B, _, H, W, D, T = warped_all.shape
-        if fixed.shape[2:] != (H, W, D):
-            fixed = F.interpolate(fixed, size=(H, W, D), mode="trilinear", align_corners=False)
-        # Expand fixed across time
-        fixed_T = fixed.unsqueeze(-1).expand_as(warped_all)
-
-        loss_l2 = l2_loss(warped_all, fixed)
-        loss_ncc = global_ncc(warped_all, fixed_T)
+        loss_l2 = l2_loss(warped_all, fixed, mask)
+        loss_ncc = local_ncc(warped_all, fixed, mask, win_size=9)
         loss_sim = 0.25 * loss_l2 + 0.75 * loss_ncc
 
+        B, _, H, W, D, T = warped_all.shape
         flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, H, W, D)
         loss_smooth = gradient_loss(flows_bt)
 
@@ -283,19 +361,14 @@ class VoxelMorphReg(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        moving, fixed = batch["moving"], batch["fixed"]
-        warped_all, flows_4d = self(moving, fixed)
+        moving, fixed, mask = batch["moving"], batch["fixed"], batch["mask"]
+        warped_all, flows_4d = self(moving, fixed, mask)
 
-        B, _, H, W, D, T = warped_all.shape
-        if fixed.shape[2:] != (H, W, D):
-            fixed = F.interpolate(fixed, size=(H, W, D), mode="trilinear", align_corners=False)
-        # Expand fixed across time
-        fixed_T = fixed.unsqueeze(-1).expand_as(warped_all)
-
-        loss_l2 = l2_loss(warped_all, fixed)
-        loss_ncc = global_ncc(warped_all, fixed_T)
+        loss_l2 = l2_loss(warped_all, fixed, mask)
+        loss_ncc = local_ncc(warped_all, fixed, mask, win_size=9)
         loss_sim = 0.25 * loss_l2 + 0.75 * loss_ncc
 
+        B, _, H, W, D, T = warped_all.shape
         flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, H, W, D)
         loss_smooth = gradient_loss(flows_bt)
 
@@ -332,7 +405,7 @@ order_execution = sys.argv[1]
 num_epochs = 30
 batch_size = 1
 lr = 1e-4
-lambda_smooth = 50
+lambda_smooth = 0.5
 num_workers = 15
 
 # -----------------------------
