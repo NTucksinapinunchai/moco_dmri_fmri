@@ -9,7 +9,7 @@ from scipy.ndimage import affine_transform
 # ---------------------------
 # Load data
 # ---------------------------
-data_dir = "/Users/kenggkkeng/Desktop/moco_dmri/data/"
+data_dir = "/Users/kenggkkeng/Desktop/sourcedata/"
 
 subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
 # subfolders = [os.path.join(data_dir, "sub-tokyoSigna2")]

@@ -7,10 +7,10 @@ import nibabel as nib
 # ---------------------------
 # Load data
 # ---------------------------
-data_dir = "/Users/kenggkkeng/Desktop/single/"
+data_dir = "/Users/kenggkkeng/Desktop/sourcedata/"
 
-# subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
-subfolders = [os.path.join(data_dir, "sub-perform")]
+subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
+# subfolders = [os.path.join(data_dir, "sub-douglas")]
 
 for subfolder in subfolders:
     print(f"Processing {subfolder} ...")
