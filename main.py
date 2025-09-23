@@ -3,6 +3,10 @@
 Created on Mon Sep 1 2025
 @author: Nontharat Tucksinapinunchai
 """
+"""
+original VoxelmorphUNet, 4D moving +4D new fixed +mask, mix loss (1,1) across time, add flow_scale, normalized_volume with mask 
+no permutation, original size and intensity, resampling instead padding, save stage and weight
+"""
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -13,14 +17,12 @@ import time
 import torch
 torch.set_float32_matmul_precision("high")
 
-import numpy as np
-import nibabel as nib
+import json
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
 from torch import optim
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
-from monai.data import load_decathlon_datalist
 from monai.data import DataLoader,Dataset
 from monai.networks.nets import VoxelMorphUNet
 from monai.networks.blocks import Warp
@@ -28,7 +30,7 @@ from monai.networks.blocks import Warp
 start_time = time.ctime()
 print("Start at:", start_time)
 
-path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/"
+base_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/"
 data_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/sourcedata/"
 sys.path.insert(0,data_path)
 json_path = os.path.join(data_path, 'dataset.json')
@@ -37,74 +39,54 @@ json_path = os.path.join(data_path, 'dataset.json')
 # DataGenerator
 # -----------------------------
 class DataGenerator(Dataset):
-    def __init__(self, file_list):
-        super().__init__(data=file_list)
+    def __init__(self, file_list, base_dir):
+        # super().__init__(data=file_list)
         self.file_list = file_list
+        self.base_dir = base_dir
 
     def __len__(self):
         return len(self.file_list)
 
     def __getitem__(self, idx):
         sample = self.file_list[idx]
-
-        moving_path = sample["moving"]
-        fixed_path = sample["fixed"]
-        mask_path = sample["mask"]
-
-        # Moving: (H, W, D, T)
-        moving_img = nib.load(moving_path)
-        moving_img = nib.as_closest_canonical(moving_img)
-        moving_np = moving_img.get_fdata()
-        moving = torch.from_numpy(moving_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D,T)
-
-        # Fixed: (H, W, D, T)
-        fixed_img = nib.load(fixed_path)
-        fixed_img = nib.as_closest_canonical(fixed_img)
-        fixed_np = fixed_img.get_fdata()
-        fixed = torch.from_numpy(fixed_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D,T)
-
-        # Mask: (H, W, D)
-        mask_img = nib.load(mask_path)
-        mask_img = nib.as_closest_canonical(mask_img)
-        mask_np = mask_img.get_fdata()
-        mask = torch.from_numpy(mask_np.astype(np.float32)).unsqueeze(0)  # (1,H,W,D)
+        pt_path = os.path.join(self.base_dir, sample["data"])
+        data = torch.load(pt_path, weights_only=False)
 
         torch.cuda.empty_cache()
-        return {"moving": moving, "fixed": fixed, "mask": mask,
-                "moving_path": moving_path, "fixed_path": fixed_path, "mask_path": mask_path}
+        return {"moving": data["moving"], "fixed": data["fixed"], "mask": data["mask"], "affine": data["affine"],
+            "data_path": pt_path}
 
 # -----------------------------
 # DataModule
 # -----------------------------
 class DataModule(pl.LightningDataModule):
-    def __init__(self, json_path, batch_size, num_workers):
+    def __init__(self, json_path, base_dir, batch_size, num_workers):
         super().__init__()
         self.json_path = json_path
+        self.base_dir = base_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
 
     def setup(self, stage=None):
-        # Load file lists from JSON
-        self.train_files = load_decathlon_datalist(self.json_path, True, "training")
-        self.val_files = load_decathlon_datalist(self.json_path, True, "validation")
-        self.test_files = load_decathlon_datalist(self.json_path, True, "testing")
+        # Load JSON
+        with open(self.json_path, "r") as f:
+            dataset_dict = json.load(f)
 
-        # Build datasets
-        self.train_ds = DataGenerator(self.train_files)
-        self.val_ds = DataGenerator(self.val_files)
-        self.test_ds = DataGenerator(self.test_files)
+        self.train_ds = DataGenerator(dataset_dict["training"], self.base_dir)
+        self.val_ds = DataGenerator(dataset_dict["validation"], self.base_dir)
+        self.test_ds = DataGenerator(dataset_dict["testing"], self.base_dir)
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True,
-                          num_workers=self.num_workers, pin_memory=True)
+                          num_workers=self.num_workers, pin_memory=True, persistent_workers=True)
 
     def val_dataloader(self):
         return DataLoader(self.val_ds, batch_size=self.batch_size, shuffle=False,
-                          num_workers=self.num_workers, pin_memory=True)
+                          num_workers=self.num_workers, pin_memory=True, persistent_workers=True)
 
     def test_dataloader(self):
         return DataLoader(self.test_ds, batch_size=self.batch_size, shuffle=False,
-                          num_workers=self.num_workers, pin_memory=True)
+                          num_workers=self.num_workers, pin_memory=True, persistent_workers=True)
 
 # -----------------------------
 # Smoothness regularization
@@ -129,86 +111,44 @@ def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor, mask: torch.Tensor, e
     for t in range(T):
         warped_t = warped_all[..., t]   # (B,1,H,W,D)
         fixed_t = fixed[..., t]         # (B,1,H,W,D)
-        mask_t = mask                   # (B,1,H,W,D)
+        mask = mask                   # (B,1,H,W,D)
 
-        warped_n = normalize_volume(warped_t)
-        fixed_n = normalize_volume(fixed_t)
+        warped_n = normalize_volume(warped_t, mask)
+        fixed_n = normalize_volume(fixed_t, mask)
 
-        warped_masked = warped_n * mask_t
-        fixed_masked = fixed_n * mask_t
+        warped_masked = warped_n * mask
+        fixed_masked = fixed_n * mask
 
         losses.append(F.mse_loss(warped_masked, fixed_masked))
 
     return torch.stack(losses).mean()
 
-# # -----------------------------
-# # Global Normalized Cross-Correlation (GNCC)
-# # -----------------------------
-# def global_ncc(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-#     B, C, H, W, D, T = a.shape
-#     ncc_vals = []
-#
-#     for t in range(T):
-#         a_t = normalize_volume(a[..., t])
-#         b_t = normalize_volume(b[..., t])
-#         m_t = mask
-#
-#         a_t = a_t * m_t
-#         b_t = b_t * m_t
-#
-#         a_mean = a_t.mean(dim=(2, 3, 4), keepdim=True)
-#         b_mean = b_t.mean(dim=(2, 3, 4), keepdim=True)
-#         a_t = a_t - a_mean
-#         b_t = b_t - b_mean
-#
-#         num = (a_t * b_t).mean(dim=(2, 3, 4), keepdim=True)
-#         den = torch.sqrt(
-#             (a_t ** 2).mean(dim=(2, 3, 4), keepdim=True) *
-#             (b_t ** 2).mean(dim=(2, 3, 4), keepdim=True)
-#         ) + eps
-#         ncc_vals.append(-(num / den).mean())
-#
-#     return torch.stack(ncc_vals).mean()
-
 # -----------------------------
-# Local Normalized Cross-Correlation (LNCC) over timepoints.
+# Global Normalized Cross-Correlation (GNCC)
 # -----------------------------
-def local_ncc(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, win_size: int = 9, eps: float = 1e-6) -> torch.Tensor:
+def global_ncc(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     B, C, H, W, D, T = a.shape
     ncc_vals = []
 
-    # convolution filter for local sums
-    sum_filt = torch.ones(1, 1, win_size, win_size, win_size, device=a.device, dtype=a.dtype)
-    win_vol = win_size ** 3
-    pad = win_size // 2
-
     for t in range(T):
-        a_t = a[..., t] * mask
-        b_t = b[..., t] * mask
+        a_t = normalize_volume(a[..., t], mask)
+        b_t = normalize_volume(b[..., t], mask)
+        m_t = mask
 
-        # reshape to (B,1,H,W,D) for conv3d
-        a_t = a_t.view(B, 1, H, W, D)
-        b_t = b_t.view(B, 1, H, W, D)
+        a_t = a_t * m_t
+        b_t = b_t * m_t
 
-        # local sums
-        I_sum = F.conv3d(a_t, sum_filt, padding=pad)
-        J_sum = F.conv3d(b_t, sum_filt, padding=pad)
+        a_mean = a_t.mean(dim=(2, 3, 4), keepdim=True)
+        b_mean = b_t.mean(dim=(2, 3, 4), keepdim=True)
+        a_t = a_t - a_mean
+        b_t = b_t - b_mean
 
-        I2_sum = F.conv3d(a_t * a_t, sum_filt, padding=pad)
-        J2_sum = F.conv3d(b_t * b_t, sum_filt, padding=pad)
-        IJ_sum = F.conv3d(a_t * b_t, sum_filt, padding=pad)
-
-        # means
-        u_I = I_sum / win_vol
-        u_J = J_sum / win_vol
-
-        # cross terms
-        cross = IJ_sum - u_J * I_sum - u_I * J_sum + u_I * u_J * win_vol
-        I_var = I2_sum - 2 * u_I * I_sum + u_I * u_I * win_vol
-        J_var = J2_sum - 2 * u_J * J_sum + u_J * u_J * win_vol
-
-        ncc = (cross * cross) / (I_var * J_var + eps)
-        ncc_vals.append(-ncc.mean())
+        num = (a_t * b_t).mean(dim=(2, 3, 4), keepdim=True)
+        den = torch.sqrt(
+            (a_t ** 2).mean(dim=(2, 3, 4), keepdim=True) *
+            (b_t ** 2).mean(dim=(2, 3, 4), keepdim=True)
+        ) + eps
+        ncc_vals.append(-(num / den).mean())
 
     return torch.stack(ncc_vals).mean()
 
@@ -225,61 +165,94 @@ def compute_padding(H, W, D, n=32):
     pad = (0, pd, 0, pw, 0, ph)
     return pad, (ph, pw, pd)
 
-def pad_moving(moving, pad):
-    # moving: (B,1,H,W,D,T)
-    B,C,H,W,D,T = moving.shape
-    padded_list = []
-    for t in range(T):
-        mov_t = moving[..., t]                # (B,1,H,W,D)
-        mov_t_pad = F.pad(mov_t, pad)         # (B,1,Hp,Wp,Dp)
-        padded_list.append(mov_t_pad)
-    return torch.stack(padded_list, dim=-1)   # (B,1,Hp,Wp,Dp,T)
+
+def resample_to_multiple(x, multiple=32, mode="trilinear"):
+    B, C, H, W, D = x.shape
+    new_H = ((H + multiple - 1) // multiple) * multiple
+    new_W = ((W + multiple - 1) // multiple) * multiple
+    new_D = ((D + multiple - 1) // multiple) * multiple
+
+    if mode in ["trilinear", "bilinear", "linear"]:
+        x_resampled = F.interpolate(x, size=(new_H, new_W, new_D),
+                                    mode=mode, align_corners=False)
+    else:
+        x_resampled = F.interpolate(x, size=(new_H, new_W, new_D),
+                                    mode=mode)
+    return x_resampled, (H, W, D)
 
 
-def unpad_5d(x, phpwpd):
-    ph, pw, pd = phpwpd
-    H, W, D = x.shape[2], x.shape[3], x.shape[4]
-    return x[:, :, 0:H-ph if ph else H,
-                   0:W-pw if pw else W,
-                   0:D-pd if pd else D]
+def resample_back(x, orig_size, mode="trilinear"):
+    H, W, D = orig_size
+    if mode in ["trilinear", "bilinear", "linear"]:
+        return F.interpolate(x, size=(H, W, D), mode=mode, align_corners=False)
+    else:
+        return F.interpolate(x, size=(H, W, D), mode=mode)
 
-# def normalize_volume(x, eps: float = 1e-6):
-#     x_cpu = x.detach().cpu().numpy()   # NumPy-based normalization, safe conversion
-#     vmin = np.percentile(x_cpu, 1)
-#     vmax = np.percentile(x_cpu, 99)
-#     x_cpu = np.clip(x_cpu, vmin, vmax)
-#     x_cpu = (x_cpu - vmin) / (vmax - vmin + eps)
-#     return torch.from_numpy(x_cpu).to(x.device, dtype=x.dtype)
+def resample_flow_back(flow, orig_size, resampled_size, mode="trilinear"):
+    H, W, D = orig_size
+    Hres, Wres, Dres = resampled_size
 
-def normalize_volume(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # Resample flow as if it was an image
+    if mode in ["trilinear", "bilinear", "linear"]:
+        flow_back = F.interpolate(flow, size=(H, W, D), mode=mode, align_corners=False)
+    else:
+        flow_back = F.interpolate(flow, size=(H, W, D), mode=mode)
+
+    # Compute scale factors (resampled voxel size vs original voxel size)
+    scale_factors = (
+        H / Hres,   # scale for axis 0 (x)
+        W / Wres,   # scale for axis 1 (y)
+        D / Dres    # scale for axis 2 (z)
+    )
+    scale = torch.tensor(scale_factors, device=flow.device, dtype=flow.dtype).view(1, 3, 1, 1, 1)
+
+    return flow_back * scale
+
+def normalize_volume(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Normalize x within mask using 1%–99% percentiles per (B,C).
+    Outside the mask, values are set to 0.
+    """
     # Flatten spatial dims → (B, C, N)
     flat = x.flatten(start_dim=2)
+    flat_mask = mask.flatten(start_dim=2)
 
-    # Compute per-sample percentiles (1% and 99%)
-    vmin = torch.quantile(flat, 0.01, dim=-1, keepdim=True)
-    vmax = torch.quantile(flat, 0.99, dim=-1, keepdim=True)
+    # Masked values only
+    masked_vals = torch.where(flat_mask > 0, flat, torch.nan)
 
-    vmin = vmin.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-    vmax = vmax.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+    # Compute per-(B,C) percentiles inside mask
+    vmin = torch.nanquantile(masked_vals, 0.01, dim=-1, keepdim=True)  # (B,C,1)
+    vmax = torch.nanquantile(masked_vals, 0.99, dim=-1, keepdim=True)  # (B,C,1)
 
-    # Clip and scale
-    x = torch.clamp(x, vmin, vmax)
-    return (x - vmin) / (vmax - vmin + eps)
+    # Reshape to broadcast
+    spatial_nd = x.ndim - 2
+    shape = list(vmin.shape[:2]) + [1] * spatial_nd
+    vmin = vmin.view(*shape)
+    vmax = vmax.view(*shape)
+
+    # Normalize inside mask
+    x_norm = torch.clamp(x, min=vmin, max=vmax)
+    x_norm = (x_norm - vmin) / (vmax - vmin + eps)
+
+    # Apply mask: keep normalized inside, zero outside
+    out = torch.where(mask > 0, x_norm, torch.zeros_like(x))
+    return out
 
 # -----------------------------
 # LightningModule
 # -----------------------------
 class VoxelMorphReg(pl.LightningModule):
-    def __init__(self, lr=1e-4, lambda_smooth=1):
+    def __init__(self, lr=1e-4, lambda_smooth=1, flow_scale=5.0):
         super().__init__()
         self.lr = lr
         self.lambda_smooth = lambda_smooth
+        self.flow_scale = flow_scale
 
         self.unet = VoxelMorphUNet(
             spatial_dims=3,
             in_channels=2,
             unet_out_channels=3,                # flow (dx, dy, dz)
-            channels=(16, 32, 32, 32, 32, 32),  # keep pairs; this is OK
+            channels=(16, 32, 32, 32),          # keep pairs; this is OK
             final_conv_channels=(16, 16),
             kernel_size=3,
             dropout=0.5
@@ -298,64 +271,65 @@ class VoxelMorphReg(pl.LightningModule):
         """
         B, C, H, W, D, T = moving.shape
 
-        # ---- Padding to multiples of 32 ----
-        pad, phpwpd = compute_padding(H, W, D, n=32)
-        fixed_pad = F.pad(fixed[..., 0], pad).unsqueeze(-1)  # pick one T since fixed is identical across T
-        moving_pad = pad_moving(moving, pad)
-        mask_pad = F.pad(mask, pad)
-        mask_pad_bin = (mask_pad > 0.5).float()
-
         warped_list, flow_list = [], []
 
         for t in range(T):
-            mov_t_raw = moving_pad[..., t]  # (B,1,Hp,Wp,Dp)
-            fix_t_raw = fixed_pad[..., 0]  # (B,1,Hp,Wp,Dp)
+            # Extract timepoint
+            mov_t_raw = moving[..., t]  # (B,1,H,W,D)
+            fix_t_raw = fixed[..., t]  # reference (same for all t)
+            mask_raw = mask  # (B,1,H,W,D)
+
+            # --- Resample all to multiples of 32 ---
+            mov_t_res, orig_size = resample_to_multiple(mov_t_raw, multiple=32, mode="trilinear")
+            fix_t_res, _ = resample_to_multiple(fix_t_raw, multiple=32, mode="trilinear")
+            mask_res, _ = resample_to_multiple(mask_raw, multiple=32, mode="nearest")
+
+            resampled_size = mov_t_res.shape[2:]  # (Hres, Wres, Dres)
+            mask_bin = (mask_res > 0.5).float()
 
             # ---- Normalize per timepoint ----
-            mov_t_norm = normalize_volume(mov_t_raw)
-            fix_t_norm = normalize_volume(fix_t_raw)
-
-            # Masked inputs
-            mov_t_norm = mov_t_norm * mask_pad_bin
-            fix_t_norm = fix_t_norm * mask_pad_bin
+            mov_t_norm = normalize_volume(mov_t_res, mask=mask_bin) * mask_bin
+            fix_t_norm = normalize_volume(fix_t_res, mask=mask_bin) * mask_bin
 
             # UNet input
-            x = torch.cat([mov_t_norm, fix_t_norm], dim=1)  # (B,2,Hp,Wp,Dp)
-            flow = self.unet(x)
+            x = torch.cat([mov_t_norm, fix_t_norm], dim=1)  # (B,2,H',W',D')
+
+            flow_res = self.unet(x)
+            flow_res = torch.tanh(flow_res) * self.flow_scale
 
             # Warp raw moving (not normalized!)
-            warped_raw = self.transformer(mov_t_raw, flow)
+            warped_res = self.transformer(mov_t_res, flow_res)
 
-            # ---- Unpad ----
-            warped_raw = unpad_5d(warped_raw, phpwpd)
-            flow = unpad_5d(flow, phpwpd)
+            # --- Resample back to original size ---
+            warped_back = resample_back(warped_res, orig_size, mode="trilinear")
+            flow_back   = resample_flow_back(flow_res, orig_size, resampled_size, mode="trilinear")
 
-            warped_list.append(warped_raw)
-            flow_list.append(flow)
+            warped_list.append(warped_back)
+            flow_list.append(flow_back)
 
-        warped_all_raw = torch.stack(warped_list, dim=-1)   # (B,1,H,W,D,T)
+        warped_all = torch.stack(warped_list, dim=-1)       # (B,1,H,W,D,T)
         flows_4d = torch.stack(flow_list, dim=-1)           # (B,3,H,W,D,T)
-        return warped_all_raw, flows_4d
+        return warped_all, flows_4d
 
     def training_step(self, batch, batch_idx):
         moving, fixed, mask = batch["moving"], batch["fixed"], batch["mask"]
         warped_all, flows_4d = self(moving, fixed, mask)
 
         loss_l2 = l2_loss(warped_all, fixed, mask)
-        loss_ncc = local_ncc(warped_all, fixed, mask, win_size=9)
-        loss_sim = 0.25 * loss_l2 + 0.75 * loss_ncc
+        loss_ncc = global_ncc(warped_all, fixed, mask)
+        loss_sim = 1 * loss_l2 + 1 * loss_ncc
 
         B, _, H, W, D, T = warped_all.shape
         flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, H, W, D)
         loss_smooth = gradient_loss(flows_bt)
 
-        loss = loss_sim + self.lambda_smooth * loss_smooth
+        loss = loss_ncc + self.lambda_smooth * loss_smooth
 
-        self.log("train_loss", loss, prog_bar=True)
-        self.log("train_l2_loss", loss_l2)
-        self.log("train_ncc_loss", loss_ncc)
-        self.log("train_sim_loss", loss_sim)
-        self.log("train_smooth_loss", loss_smooth)
+        self.log("train_loss", loss, prog_bar=True, batch_size=B)
+        self.log("train_l2_loss", loss_l2, batch_size=B)
+        self.log("train_ncc_loss", loss_ncc, batch_size=B)
+        self.log("train_sim_loss", loss_sim, batch_size=B)
+        self.log("train_smooth_loss", loss_smooth, batch_size=B)
 
         torch.cuda.empty_cache()
         return loss
@@ -365,20 +339,20 @@ class VoxelMorphReg(pl.LightningModule):
         warped_all, flows_4d = self(moving, fixed, mask)
 
         loss_l2 = l2_loss(warped_all, fixed, mask)
-        loss_ncc = local_ncc(warped_all, fixed, mask, win_size=9)
-        loss_sim = 0.25 * loss_l2 + 0.75 * loss_ncc
+        loss_ncc = global_ncc(warped_all, fixed, mask)
+        loss_sim = 1 * loss_l2 + 1 * loss_ncc
 
         B, _, H, W, D, T = warped_all.shape
         flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, H, W, D)
         loss_smooth = gradient_loss(flows_bt)
 
-        loss = loss_sim + self.lambda_smooth * loss_smooth
+        loss = loss_ncc + self.lambda_smooth * loss_smooth
 
-        self.log("val_loss", loss, prog_bar=True)
-        self.log("val_l2_loss", loss_l2)
-        self.log("val_ncc_loss", loss_ncc)
-        self.log("val_sim_loss", loss_sim)
-        self.log("val_smooth_loss", loss_smooth)
+        self.log("val_loss", loss, prog_bar=True, batch_size=B)
+        self.log("val_l2_loss", loss_l2, batch_size=B)
+        self.log("val_ncc_loss", loss_ncc, batch_size=B)
+        self.log("val_sim_loss", loss_sim, batch_size=B)
+        self.log("val_smooth_loss", loss_smooth, batch_size=B)
 
         torch.cuda.empty_cache()
         return loss
@@ -402,16 +376,16 @@ class VoxelMorphReg(pl.LightningModule):
 # logger (Weights & Biases)
 # -----------------------------
 order_execution = sys.argv[1]
-num_epochs = 30
+num_epochs = 150
 batch_size = 1
 lr = 1e-4
-lambda_smooth = 0.5
-num_workers = 15
+lambda_smooth = 0.1
+num_workers = 8
 
 # -----------------------------
 # callbacks
 # -----------------------------
-ckpt_dir = os.path.join(path, 'trained_weights')
+ckpt_dir = os.path.join(base_path, 'trained_weights')
 os.makedirs(ckpt_dir, exist_ok=True)
 pretrained_ckpt = os.path.join(ckpt_dir, f"{order_execution}_voxelmorph_best-weighted.ckpt")
 
@@ -421,7 +395,7 @@ checkpoint_cb = ModelCheckpoint(
     monitor="val_loss",
     mode="min",
     save_top_k=1,
-    save_weights_only=True
+    save_weights_only=False
 )
 
 lr_monitor = LearningRateMonitor(logging_interval="epoch")
@@ -432,16 +406,17 @@ early_stop = EarlyStopping(
     verbose=True
 )
 
-if os.path.exists(pretrained_ckpt):
-    print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
-    model = VoxelMorphReg.load_from_checkpoint(
-        pretrained_ckpt,
-        lr=lr,
-        lambda_smooth=lambda_smooth
-    )
-else:
-    print("No pretrained checkpoint found, training from scratch.")
-    model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth)
+# # Load only model weights (use checkpoint as initialization for a new run)
+# if os.path.exists(pretrained_ckpt):
+#     print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
+#     model = VoxelMorphReg.load_from_checkpoint(
+#         pretrained_ckpt,
+#         lr=lr,
+#         lambda_smooth=lambda_smooth
+#     )
+# else:
+#     print("No pretrained checkpoint found, training from scratch.")
+model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth)
 
 # -----------------------------
 # trainer
@@ -452,6 +427,8 @@ if __name__ == "__main__":
 
     wandb.login(key="ab48d9c3a5dee9883bcb676015f2487c1bc51f74")
     wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution}_VoxelMorphUNet")
+    # If continue with the pretrained_ckpt, resume logs to the same wandb run
+    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution}_VoxelMorphUNet", id="kzv9u4mi", resume="must")
     wandb_config = wandb_logger.experiment.config
     wandb_config.update({
         "num_epochs": num_epochs,
@@ -459,8 +436,9 @@ if __name__ == "__main__":
         "lr": lr,
         "lambda_smooth": lambda_smooth,
         "data_path": data_path
-    })
-    dm = DataModule(json_path=json_path, batch_size=batch_size, num_workers=num_workers)
+    }, allow_val_change=True)
+
+    dm = DataModule(json_path=json_path, base_dir=base_path, batch_size=batch_size, num_workers=num_workers)
     trainer = pl.Trainer(
         max_epochs=num_epochs,
         logger=wandb_logger,
@@ -468,7 +446,7 @@ if __name__ == "__main__":
         accelerator="gpu",
         devices=1,
         precision="16-mixed",
-        log_every_n_steps=5,
+        log_every_n_steps=10,
         deterministic=False,
         enable_progress_bar=True,
         enable_model_summary=True,
@@ -478,13 +456,13 @@ if __name__ == "__main__":
     # -----------------------------
     # fit
     # -----------------------------
-    # if os.path.exists(pretrained_ckpt):
-    #     print(f"Resuming training from: {pretrained_ckpt}")
-    #     trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
-    # else:
-    #     print("No checkpoint found, training from scratch.")
-
-    trainer.fit(model, datamodule=dm)
+    # Load full checkpoint (resume training exactly where it left off)
+    if os.path.exists(pretrained_ckpt):
+        print(f"Resuming training from: {pretrained_ckpt}")
+        trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
+    else:
+        print("No checkpoint found, training from scratch.")
+        trainer.fit(model, datamodule=dm)
 
     # -----------------------------
     # Best checkpoint info
