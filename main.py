@@ -4,7 +4,7 @@ Created on Mon Sep 1 2025
 @author: Nontharat Tucksinapinunchai
 """
 """
-original VoxelmorphUNet, 4D moving +4D new fixed +mask, mix loss (1,1) across time, add flow_scale, normalized_volume with mask 
+original VoxelmorphUNet no dropout, 4D moving +4D new fixed +mask, mix loss (1,1) across time, add flow_scale, normalized_volume with mask, lambda smooth=0.05
 no permutation, original size and intensity, resampling instead padding, save stage and weight
 """
 
@@ -198,7 +198,6 @@ def resample_flow_back(flow, orig_size, resampled_size, mode="trilinear"):
     else:
         flow_back = F.interpolate(flow, size=(H, W, D), mode=mode)
 
-    # Compute scale factors (resampled voxel size vs original voxel size)
     scale_factors = (
         H / Hres,   # scale for axis 0 (x)
         W / Wres,   # scale for axis 1 (y)
@@ -252,10 +251,10 @@ class VoxelMorphReg(pl.LightningModule):
             spatial_dims=3,
             in_channels=2,
             unet_out_channels=3,                # flow (dx, dy, dz)
-            channels=(16, 32, 32, 32),          # keep pairs; this is OK
-            final_conv_channels=(16, 16),
+            channels=(16, 32, 32, 32, ),          # keep pairs; this is OK
+            final_conv_channels=(16, ),
             kernel_size=3,
-            dropout=0.5
+            # dropout=0.5
         )
         # Use border padding to reduce black edge artifacts
         self.transformer = Warp(mode="bilinear", padding_mode="border")
@@ -274,7 +273,6 @@ class VoxelMorphReg(pl.LightningModule):
         warped_list, flow_list = [], []
 
         for t in range(T):
-            # Extract timepoint
             mov_t_raw = moving[..., t]  # (B,1,H,W,D)
             fix_t_raw = fixed[..., t]  # reference (same for all t)
             mask_raw = mask  # (B,1,H,W,D)
@@ -379,7 +377,7 @@ order_execution = sys.argv[1]
 num_epochs = 150
 batch_size = 1
 lr = 1e-4
-lambda_smooth = 0.1
+lambda_smooth = 0.05
 num_workers = 8
 
 # -----------------------------
