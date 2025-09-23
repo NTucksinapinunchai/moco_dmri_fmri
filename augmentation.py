@@ -94,11 +94,6 @@ for subfolder in subfolders:
     # Define transforms
     # -----------------------
     slicewise_tf = RandSliceWiseAffine(max_rot=5, max_shift=2, prob=0.9, axis=spine_axis)
-    # artifact_tf = tio.Compose([
-    #     tio.RandomBiasField(coefficients=(0.1, 0.5), p=0.5),
-    #     tio.RandomGhosting(num_ghosts=4, axes=2, p=0.5),
-    #     tio.RandomSpike(num_spikes=2, intensity=(0.1, 0.5), p=0.5),
-    # ])
 
     # -----------------------
     # Apply augmentation volume-by-volume
@@ -108,14 +103,6 @@ for subfolder in subfolders:
         aug_vol = slicewise_tf(vol)
         aug_data[:, :, :, t] = aug_vol
         print(f"Augmented volume {t + 1}/{T}")
-
-    # aug_data = artifact_tf(aug_data)
-    # print("Add MR Artifacts")
-
-    # orig_min, orig_max = data.min(), data.max()
-    # aug_min, aug_max = aug_data.min(), aug_data.max()
-    # aug_data = (aug_data - aug_min) / (aug_max - aug_min + 1e-8)  # normalize [0,1]
-    # aug_data = aug_data * (orig_max - orig_min) + orig_min
 
     # -----------------------
     # Save augmented 4D data
