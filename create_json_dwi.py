@@ -63,7 +63,7 @@ def build_entries(subject_list, split_name):
             mask, _ = load_as_tensor(mask_path, add_channel=True)      # (1,H,W,D)
 
             # Save into prepared directory
-            out_folder = os.path.join(target_dir, "sourcedata", split_name, sub, "dwi")
+            out_folder = os.path.join(target_dir, "dmri_dataset", split_name, sub, "dwi")
             os.makedirs(out_folder, exist_ok=True)
             # Copy the original NIfTI files
             for src in [moving_path, fixed_path, mask_path]:
@@ -100,7 +100,7 @@ dataset_dict = {
 # -----------------------------
 # Save JSON inside prepared/
 # -----------------------------
-out_path = os.path.join(target_dir, "dmri", "dataset.json")
+out_path = os.path.join(target_dir, "dmri_dataset", "dataset.json")
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 with open(out_path, "w") as f:
     json.dump(dataset_dict, f, indent=2)
