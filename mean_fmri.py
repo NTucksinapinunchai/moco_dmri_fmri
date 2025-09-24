@@ -9,8 +9,8 @@ import nibabel as nib
 # ---------------------------
 data_dir = "/Users/kenggkkeng/Desktop/fmri_dataset/"
 
-# subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
-subfolders = [os.path.join(data_dir, "sub-21")]
+subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
+# subfolders = [os.path.join(data_dir, "")]
 
 for sub in subfolders:
     sessions = sorted([f.path for f in os.scandir(sub) if f.is_dir() and f.name.startswith("ses-")])
