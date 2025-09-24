@@ -7,6 +7,54 @@ import torchio as tio
 from scipy.ndimage import affine_transform
 
 # ---------------------------
+# Custom slice-wise transform
+# ---------------------------
+class RandSliceWiseAffine:
+    def __init__(self, max_rot=5, max_shift=2, prob=0.9, axis=2):
+        self.max_rot = max_rot
+        self.max_shift = max_shift
+        self.prob = prob
+        self.axis = axis
+
+    def __call__(self, vol: np.ndarray) -> np.ndarray:
+        out = vol.copy()
+        if np.random.rand() > self.prob:
+            return out
+
+        H, W, D = out.shape
+        if self.axis != 2:
+            out = np.moveaxis(out, self.axis, -1)
+            H, W, D = out.shape
+
+        for idx in range(D):
+            angle = np.random.uniform(-self.max_rot, self.max_rot)
+            tx = np.random.uniform(-self.max_shift, self.max_shift)
+            ty = np.random.uniform(-self.max_shift, self.max_shift)
+
+            theta = np.deg2rad(angle)
+            rot = np.array([[np.cos(theta), -np.sin(theta)],
+                            [np.sin(theta), np.cos(theta)]])
+            center = np.array([H / 2, W / 2])
+            inv_rot = np.linalg.inv(rot)
+            offset = center - inv_rot @ center + np.array([tx, ty])
+
+            out[:, :, idx] = affine_transform(
+                out[:, :, idx], inv_rot, offset=offset,
+                order=0, mode="nearest"
+            )
+
+        if self.axis != 2:
+            out = np.moveaxis(out, -1, self.axis)
+
+        return out
+
+# -----------------------
+# Define transforms
+# -----------------------
+spine_axis = 2  # slice axis = axial slices through C-spine
+slicewise_tf = RandSliceWiseAffine(max_rot=5, max_shift=2, prob=0.9, axis=spine_axis)
+
+# ---------------------------
 # Load data
 # ---------------------------
 data_dir = "/Users/kenggkkeng/Desktop/dmri_dataset/"
@@ -14,25 +62,25 @@ data_dir = "/Users/kenggkkeng/Desktop/dmri_dataset/"
 subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
 # subfolders = [os.path.join(data_dir, "sub-tokyoSigna2")]
 
-for subfolder in subfolders:
-    print(f"Processing {subfolder} ...")
+for sub in subfolders:
+    print(f"Processing {sub} ...")
 
     # Find NIfTI file inside the current subfolder
-    nii_files = glob.glob(os.path.join(subfolder, "dwi", "sub-*dwi.nii.gz"))
+    nii_files = glob.glob(os.path.join(sub, "dwi", "sub-*dwi.nii.gz"))
     if len(nii_files) == 0:
-        raise FileNotFoundError(f"No NIfTI file found in {subfolder}")
+        raise FileNotFoundError(f"No NIfTI file found in {sub}")
     input_img = nii_files[0]
     print("Found NIfTI:", input_img)
 
     # Find bvec file inside the current subfolder
-    bvec_files = glob.glob(os.path.join(subfolder, "dwi", "*.bvec"))
+    bvec_files = glob.glob(os.path.join(sub, "dwi", "*.bvec"))
     if len(bvec_files) == 0:
-        raise FileNotFoundError(f"No bvec file found in {subfolder}")
+        raise FileNotFoundError(f"No bvec file found in {sub}")
     bvec_file = bvec_files[0]
     print("Found bvec:", bvec_file)
 
     basename = os.path.basename(input_img)
-    output_img = os.path.join(subfolder, "dwi", "aug_" + basename)
+    output_img = os.path.join(sub, "dwi", "aug_" + basename)
 
     img = nib.load(input_img)
     data = img.get_fdata().astype(np.float32)
@@ -45,55 +93,7 @@ for subfolder in subfolders:
     print("B0 volumes indices:", np.where(~is_dwi)[0])
     print("DWI volumes indices:", np.where(is_dwi)[0])
 
-    spine_axis = 2  # slice axis = axial slices through C-spine
     aug_data = np.zeros_like(data)
-
-    # ---------------------------
-    # Custom slice-wise transform
-    # ---------------------------
-    class RandSliceWiseAffine:
-        def __init__(self, max_rot=5, max_shift=2, prob=0.9, axis=spine_axis):
-            self.max_rot = max_rot
-            self.max_shift = max_shift
-            self.prob = prob
-            self.axis = axis
-
-        def __call__(self, vol: np.ndarray) -> np.ndarray:
-            out = vol.copy()
-            if np.random.rand() > self.prob:
-                return out
-
-            H, W, D = out.shape
-            if self.axis != 2:
-                out = np.moveaxis(out, self.axis, -1)
-                H, W, D = out.shape
-
-            for idx in range(D):
-                angle = np.random.uniform(-self.max_rot, self.max_rot)
-                tx = np.random.uniform(-self.max_shift, self.max_shift)
-                ty = np.random.uniform(-self.max_shift, self.max_shift)
-
-                theta = np.deg2rad(angle)
-                rot = np.array([[np.cos(theta), -np.sin(theta)],
-                                [np.sin(theta), np.cos(theta)]])
-                center = np.array([H / 2, W / 2])
-                inv_rot = np.linalg.inv(rot)
-                offset = center - inv_rot @ center + np.array([tx, ty])
-
-                out[:, :, idx] = affine_transform(
-                    out[:, :, idx], inv_rot, offset=offset,
-                    order=0, mode="nearest"
-                )
-
-            if self.axis != 2:
-                out = np.moveaxis(out, -1, self.axis)
-
-            return out
-
-    # -----------------------
-    # Define transforms
-    # -----------------------
-    slicewise_tf = RandSliceWiseAffine(max_rot=5, max_shift=2, prob=0.9, axis=spine_axis)
 
     # -----------------------
     # Apply augmentation volume-by-volume
