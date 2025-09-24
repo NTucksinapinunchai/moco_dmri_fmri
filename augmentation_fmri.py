@@ -76,8 +76,13 @@ for sub in subfolders:
         input_img = nii_files[0]
         print("Found NIfTI:", input_img)
 
-        basename = os.path.basename(input_img)
-        output_img = os.path.join(target, "func", "aug_" + basename)
+        root = os.path.basename(input_img)
+        parts = root.split("_")
+        if parts[1].startswith("ses-"):
+            prefix = "_".join(parts[:2])
+        else:
+            prefix = parts[0]
+        output_img = os.path.join(target, "func", f"aug_{prefix}_bold.nii.gz")
 
         img = nib.load(input_img)
         data = img.get_fdata().astype(np.float32)
