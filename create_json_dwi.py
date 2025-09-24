@@ -100,7 +100,7 @@ dataset_dict = {
 # -----------------------------
 # Save JSON inside prepared/
 # -----------------------------
-out_path = os.path.join(target_dir, "sourcedata", "dataset.json")
+out_path = os.path.join(target_dir, "dmri", "dataset.json")
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 with open(out_path, "w") as f:
     json.dump(dataset_dict, f, indent=2)
