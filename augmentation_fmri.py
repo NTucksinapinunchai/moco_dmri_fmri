@@ -69,6 +69,7 @@ for sub in subfolders:
 
     for target in targets:
         print(f"Processing {target} ...")
+
         nii_files = glob.glob(os.path.join(target, "func", "sub-*bold.nii.gz"))
         if len(nii_files) == 0:
             print(f"No NIfTI file found in {target}")
