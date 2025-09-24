@@ -8,7 +8,7 @@ import nibabel as nib
 
 from glob import glob
 
-base_dir = "/Users/kenggkkeng/Desktop/sourcedata/"
+base_dir = "/Users/kenggkkeng/Desktop/dmri_dataset/"
 target_dir = os.path.join(base_dir, "prepared")
 os.makedirs(target_dir, exist_ok=True)
 

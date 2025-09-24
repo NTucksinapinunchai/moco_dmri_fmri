@@ -31,7 +31,7 @@ start_time = time.ctime()
 print("Start at:", start_time)
 
 base_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/"
-data_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/sourcedata/"
+data_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/dmri_dataset/"
 sys.path.insert(0,data_path)
 json_path = os.path.join(data_path, 'dataset.json')
 
