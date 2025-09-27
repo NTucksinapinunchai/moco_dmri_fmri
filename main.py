@@ -12,6 +12,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import gc
 import sys
 import time
 import torch
@@ -31,7 +32,7 @@ start_time = time.ctime()
 print("Start at:", start_time)
 
 base_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/"
-data_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/dmri_dataset/"
+data_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/fmri_dataset/"
 sys.path.insert(0,data_path)
 json_path = os.path.join(data_path, 'dataset.json')
 
@@ -52,7 +53,6 @@ class DataGenerator(Dataset):
         pt_path = os.path.join(self.base_dir, sample["data"])
         data = torch.load(pt_path, weights_only=False)
 
-        torch.cuda.empty_cache()
         return {"moving": data["moving"], "fixed": data["fixed"], "mask": data["mask"], "affine": data["affine"],
             "data_path": pt_path}
 
@@ -92,15 +92,14 @@ class DataModule(pl.LightningDataModule):
 # Smoothness regularization
 # -----------------------------
 def gradient_loss(flow_5d: torch.Tensor) -> torch.Tensor:
-    # flow_5d: (B, 3, H, W, D)
-    dz = torch.abs(flow_5d[:, :, :, :, 1:] - flow_5d[:, :, :, :, :-1])  # along D
-    dy = torch.abs(flow_5d[:, :, :, 1:, :] - flow_5d[:, :, :, :-1, :])  # along W
-    dx = torch.abs(flow_5d[:, :, 1:, :, :] - flow_5d[:, :, :-1, :, :])  # along H
+    dx = flow_5d[:, :, 1:, :, :] - flow_5d[:, :, :-1, :, :]
+    dy = flow_5d[:, :, :, 1:, :] - flow_5d[:, :, :, :-1, :]
+    dz = flow_5d[:, :, :, :, 1:] - flow_5d[:, :, :, :, :-1]
 
-    dz = F.pad(dz, (0, 1, 0, 0, 0, 0))
-    dy = F.pad(dy, (0, 0, 0, 1, 0, 0))
-    dx = F.pad(dx, (0, 0, 0, 0, 0, 1))
-    return torch.mean(dx**2 + dy**2 + dz**2)
+    loss = (dx.pow(2).mean() +
+            dy.pow(2).mean() +
+            dz.pow(2).mean()) / 3.0
+    return loss
 
 # -----------------------------
 # L2 loss (MSE)
@@ -318,8 +317,11 @@ class VoxelMorphReg(pl.LightningModule):
         loss_sim = 1 * loss_l2 + 1 * loss_ncc
 
         B, _, H, W, D, T = warped_all.shape
-        flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, H, W, D)
-        loss_smooth = gradient_loss(flows_bt)
+        loss_smooth = 0.0
+        for t in range(T):
+            flow_t = flows_4d[..., t]  # (B,3,H,W,D)
+            loss_smooth = loss_smooth + gradient_loss(flow_t.half()).float()
+        loss_smooth = loss_smooth / T
 
         loss = loss_ncc + self.lambda_smooth * loss_smooth
 
@@ -329,7 +331,6 @@ class VoxelMorphReg(pl.LightningModule):
         self.log("train_sim_loss", loss_sim, batch_size=B)
         self.log("train_smooth_loss", loss_smooth, batch_size=B)
 
-        torch.cuda.empty_cache()
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -341,8 +342,11 @@ class VoxelMorphReg(pl.LightningModule):
         loss_sim = 1 * loss_l2 + 1 * loss_ncc
 
         B, _, H, W, D, T = warped_all.shape
-        flows_bt = flows_4d.permute(0, 5, 1, 2, 3, 4).reshape(B * T, 3, H, W, D)
-        loss_smooth = gradient_loss(flows_bt)
+        loss_smooth = 0.0
+        for t in range(T):
+            flow_t = flows_4d[..., t]  # (B,3,H,W,D)
+            loss_smooth = loss_smooth + gradient_loss(flow_t.half()).float()
+        loss_smooth = loss_smooth / T
 
         loss = loss_ncc + self.lambda_smooth * loss_smooth
 
@@ -352,7 +356,6 @@ class VoxelMorphReg(pl.LightningModule):
         self.log("val_sim_loss", loss_sim, batch_size=B)
         self.log("val_smooth_loss", loss_smooth, batch_size=B)
 
-        torch.cuda.empty_cache()
         return loss
 
     def configure_optimizers(self):
@@ -373,8 +376,7 @@ class VoxelMorphReg(pl.LightningModule):
 # -----------------------------
 # logger (Weights & Biases)
 # -----------------------------
-order_execution = sys.argv[1]
-num_epochs = 150
+num_epochs = 100
 batch_size = 1
 lr = 1e-4
 lambda_smooth = 0.05
@@ -383,13 +385,21 @@ num_workers = 8
 # -----------------------------
 # callbacks
 # -----------------------------
+order_execution_1 = sys.argv[1]
 ckpt_dir = os.path.join(base_path, 'trained_weights')
 os.makedirs(ckpt_dir, exist_ok=True)
-pretrained_ckpt = os.path.join(ckpt_dir, f"{order_execution}_voxelmorph_best-weighted.ckpt")
+
+if len(sys.argv) > 2:
+    order_execution_2 = sys.argv[2]
+    pretrained_ckpt = os.path.join(ckpt_dir, f"{order_execution_1}_voxelmorph_best-weighted.ckpt")
+    ckpt_name = f"{order_execution_2}_voxelmorph_best-weighted"
+else:
+    pretrained_ckpt = None
+    ckpt_name = f"{order_execution_1}_voxelmorph_best-weighted"
 
 checkpoint_cb = ModelCheckpoint(
     dirpath=ckpt_dir,
-    filename=f"{order_execution}_voxelmorph_best-weighted",
+    filename=ckpt_name,
     monitor="val_loss",
     mode="min",
     save_top_k=1,
@@ -404,17 +414,17 @@ early_stop = EarlyStopping(
     verbose=True
 )
 
-# # Load only model weights (use checkpoint as initialization for a new run)
-# if os.path.exists(pretrained_ckpt):
-#     print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
-#     model = VoxelMorphReg.load_from_checkpoint(
-#         pretrained_ckpt,
-#         lr=lr,
-#         lambda_smooth=lambda_smooth
-#     )
-# else:
-#     print("No pretrained checkpoint found, training from scratch.")
-model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth)
+# Load only model weights (use checkpoint as initialization for a new run)
+if os.path.exists(pretrained_ckpt):
+    print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
+    model = VoxelMorphReg.load_from_checkpoint(
+        pretrained_ckpt,
+        lr=lr,
+        lambda_smooth=lambda_smooth
+    )
+else:
+    print("No pretrained checkpoint found, training from scratch.")
+    model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth)
 
 # -----------------------------
 # trainer
@@ -424,7 +434,7 @@ if __name__ == "__main__":
     from pytorch_lightning.loggers import WandbLogger
 
     wandb.login(key="ab48d9c3a5dee9883bcb676015f2487c1bc51f74")
-    wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution}_VoxelMorphUNet")
+    wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_2}_VoxelMorphUNet")
     # If continue with the pretrained_ckpt, resume logs to the same wandb run
     # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution}_VoxelMorphUNet", id="kzv9u4mi", resume="must")
     wandb_config = wandb_logger.experiment.config
@@ -437,13 +447,15 @@ if __name__ == "__main__":
     }, allow_val_change=True)
 
     dm = DataModule(json_path=json_path, base_dir=base_path, batch_size=batch_size, num_workers=num_workers)
+    gc.collect()
+    torch.cuda.empty_cache()
     trainer = pl.Trainer(
         max_epochs=num_epochs,
         logger=wandb_logger,
         callbacks=[checkpoint_cb, lr_monitor, early_stop],
         accelerator="gpu",
         devices=1,
-        precision="16-mixed",
+        precision=16,
         log_every_n_steps=10,
         deterministic=False,
         enable_progress_bar=True,
@@ -455,12 +467,12 @@ if __name__ == "__main__":
     # fit
     # -----------------------------
     # Load full checkpoint (resume training exactly where it left off)
-    if os.path.exists(pretrained_ckpt):
-        print(f"Resuming training from: {pretrained_ckpt}")
-        trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
-    else:
-        print("No checkpoint found, training from scratch.")
-        trainer.fit(model, datamodule=dm)
+    # if os.path.exists(pretrained_ckpt):
+    #     print(f"Resuming training from: {pretrained_ckpt}")
+    #     trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
+    # else:
+    #     print("No checkpoint found, training from scratch.")
+    trainer.fit(model, datamodule=dm)
 
     # -----------------------------
     # Best checkpoint info
