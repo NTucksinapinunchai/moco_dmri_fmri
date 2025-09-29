@@ -376,7 +376,7 @@ class VoxelMorphReg(pl.LightningModule):
 # -----------------------------
 # logger (Weights & Biases)
 # -----------------------------
-num_epochs = 100
+num_epochs = 200
 batch_size = 1
 lr = 1e-4
 lambda_smooth = 0.05
@@ -415,16 +415,16 @@ early_stop = EarlyStopping(
 )
 
 # Load only model weights (use checkpoint as initialization for a new run)
-if os.path.exists(pretrained_ckpt):
-    print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
-    model = VoxelMorphReg.load_from_checkpoint(
-        pretrained_ckpt,
-        lr=lr,
-        lambda_smooth=lambda_smooth
-    )
-else:
-    print("No pretrained checkpoint found, training from scratch.")
-    model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth)
+# if os.path.exists(pretrained_ckpt):
+#     print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
+#     model = VoxelMorphReg.load_from_checkpoint(
+#         pretrained_ckpt,
+#         lr=lr,
+#         lambda_smooth=lambda_smooth
+#     )
+# else:
+#     print("No pretrained checkpoint found, training from scratch.")
+model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth)
 
 # -----------------------------
 # trainer
@@ -434,9 +434,9 @@ if __name__ == "__main__":
     from pytorch_lightning.loggers import WandbLogger
 
     wandb.login(key="ab48d9c3a5dee9883bcb676015f2487c1bc51f74")
-    wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_2}_VoxelMorphUNet")
+    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_2}_VoxelMorphUNet")
     # If continue with the pretrained_ckpt, resume logs to the same wandb run
-    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution}_VoxelMorphUNet", id="kzv9u4mi", resume="must")
+    wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}_VoxelMorphUNet", id="36pzulfc", resume="must")
     wandb_config = wandb_logger.experiment.config
     wandb_config.update({
         "num_epochs": num_epochs,
@@ -467,12 +467,12 @@ if __name__ == "__main__":
     # fit
     # -----------------------------
     # Load full checkpoint (resume training exactly where it left off)
-    # if os.path.exists(pretrained_ckpt):
-    #     print(f"Resuming training from: {pretrained_ckpt}")
-    #     trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
-    # else:
-    #     print("No checkpoint found, training from scratch.")
-    trainer.fit(model, datamodule=dm)
+    if os.path.exists(pretrained_ckpt):
+        print(f"Resuming training from: {pretrained_ckpt}")
+        trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
+    else:
+        print("No checkpoint found, training from scratch.")
+        trainer.fit(model, datamodule=dm)
 
     # -----------------------------
     # Best checkpoint info
