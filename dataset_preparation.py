@@ -35,6 +35,7 @@ def load_as_tensor(nii_path, add_channel=True):
 # -----------------------------
 def build_entries(subject_list, split_name, base_dir, target_dir, mode):
     entries = []
+    dataset_root = f"{mode}_dataset"
     for sub_ses in subject_list:
         if "_ses-" in sub_ses:
             sub, ses = sub_ses.split("_", 1)
@@ -89,7 +90,7 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
             # ---------------------------
             if split_name == "testing" and os.path.exists(extra_pattern):
                 shutil.copy2(extra_pattern, out_folder)
-                print(f"[Testing] Copied extra file: {extra_pattern}")
+                print(f"Copied extra file: {extra_pattern}")
 
             # Save as .pt
             pt_filename = os.path.basename(moving_path).replace("aug_", "paired_").replace(".nii.gz", ".pt")
@@ -97,7 +98,8 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
             torch.save({"moving": moving, "fixed": fixed, "mask": mask, "affine": affine}, pt_path)
 
             # JSON entry
-            entry = {"data": os.path.relpath(pt_path, target_dir)}
+            rel_to_dataset = os.path.relpath(pt_path, os.path.join(target_dir, dataset_root))
+            entry = {"data": rel_to_dataset}
             entries.append(entry)
     entries = sorted(entries, key=lambda e: e["data"])
     return entries

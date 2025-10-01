@@ -60,7 +60,7 @@ if len(sys.argv) < 3:
     sys.exit(1)
 
 base_path = sys.argv[1]                          # e.g. /home/.../moco_dmri/
-data_path = sys.argv[2]                     # e.g. fmri_dataset or dmri_dataset
+data_path = sys.argv[2]                          # e.g. /home/.../prepared/dmri_dataset
 order_execution_1 = sys.argv[3]                  # run name
 order_execution_2 = sys.argv[4] if len(sys.argv) > 4 else None
 
@@ -74,17 +74,27 @@ print("JSON path   :", json_path)
 # DataGenerator
 # -----------------------------
 class DataGenerator(Dataset):
-    def __init__(self, file_list, base_dir):
+    def __init__(self, file_list, data_dir):
         self.file_list = file_list
-        self.base_dir = base_dir
+        self.data_dir = data_dir
 
     def __len__(self):
         return len(self.file_list)
 
     def __getitem__(self, idx):
         sample = self.file_list[idx]
-        pt_path = os.path.join(self.base_dir, sample["data"])
-        data = torch.load(pt_path, weights_only=False)
+        pt_path = sample["data"]
+
+        # If absolute path in JSON
+        if os.path.isabs(pt_path):
+            final_path = pt_path
+        else:
+            final_path = os.path.join(self.data_dir, pt_path)
+
+        if not os.path.exists(final_path):
+            raise FileNotFoundError(f"Could not find file: {final_path}")
+
+        data = torch.load(final_path, weights_only=False)
 
         return {"moving": data["moving"], "fixed": data["fixed"], "mask": data["mask"],
                 "affine": data["affine"], "data_path": pt_path}
@@ -93,10 +103,10 @@ class DataGenerator(Dataset):
 # DataModule
 # -----------------------------
 class DataModule(pl.LightningDataModule):
-    def __init__(self, json_path, base_dir, batch_size, num_workers):
+    def __init__(self, json_path, data_dir, batch_size, num_workers):
         super().__init__()
         self.json_path = json_path
-        self.base_dir = base_dir
+        self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
 
@@ -105,9 +115,9 @@ class DataModule(pl.LightningDataModule):
         with open(self.json_path, "r") as f:
             dataset_dict = json.load(f)
 
-        self.train_ds = DataGenerator(dataset_dict["training"], self.base_dir)
-        self.val_ds = DataGenerator(dataset_dict["validation"], self.base_dir)
-        self.test_ds = DataGenerator(dataset_dict["testing"], self.base_dir)
+        self.train_ds = DataGenerator(dataset_dict["training"], self.data_dir)
+        self.val_ds = DataGenerator(dataset_dict["validation"], self.data_dir)
+        self.test_ds = DataGenerator(dataset_dict["testing"], self.data_dir)
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True,
@@ -265,7 +275,7 @@ def global_ncc(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, eps: float 
 # LightningModule
 # -----------------------------
 class VoxelMorphReg(pl.LightningModule):
-    def __init__(self, lr=1e-4, lambda_smooth=1, flow_scale=5.0):
+    def __init__(self, lr=1e-4, lambda_smooth=0.01, flow_scale=3.0):
         super().__init__()
         self.lr = lr
         self.lambda_smooth = lambda_smooth
@@ -281,7 +291,7 @@ class VoxelMorphReg(pl.LightningModule):
             # dropout=0.5
         )
         # Use border padding to reduce black edge artifacts
-        self.transformer = Warp(mode="nearest", padding_mode="border")      # change from "bilinear" to observe over-smoothed effect
+        self.transformer = Warp(mode="bilinear", padding_mode="border")
 
     def forward(self, moving, fixed, mask):
         """
@@ -352,7 +362,7 @@ class VoxelMorphReg(pl.LightningModule):
         loss_smooth = 0.0
         for t in range(T):
             flow_t = flows_4d[..., t]  # (B,3,H,W,D)
-            loss_smooth = loss_smooth + gradient_loss(flow_t.half()).float()
+            loss_smooth = loss_smooth + gradient_loss(flow_t).float()
         loss_smooth = loss_smooth / T
 
         loss = loss_ncc + self.lambda_smooth * loss_smooth
@@ -377,7 +387,7 @@ class VoxelMorphReg(pl.LightningModule):
         loss_smooth = 0.0
         for t in range(T):
             flow_t = flows_4d[..., t]  # (B,3,H,W,D)
-            loss_smooth = loss_smooth + gradient_loss(flow_t.half()).float()
+            loss_smooth = loss_smooth + gradient_loss(flow_t).float()
         loss_smooth = loss_smooth / T
 
         loss = loss_ncc + self.lambda_smooth * loss_smooth
@@ -411,7 +421,7 @@ class VoxelMorphReg(pl.LightningModule):
 num_epochs = 150
 batch_size = 1
 lr = 1e-4
-lambda_smooth = 0.05
+lambda_smooth = 0.01
 num_workers = 8
 
 # -----------------------------
@@ -440,7 +450,7 @@ lr_monitor = LearningRateMonitor(logging_interval="epoch")
 early_stop = EarlyStopping(monitor="val_loss", mode="min", patience=25, verbose=True)
 
 # Load only model weights (use checkpoint as initialization for a new run)
-if os.path.exists(pretrained_ckpt):
+if pretrained_ckpt is not None and os.path.exists(pretrained_ckpt):
     print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
     model = VoxelMorphReg.load_from_checkpoint(pretrained_ckpt, lr=lr, lambda_smooth=lambda_smooth)
 else:
@@ -467,7 +477,7 @@ if __name__ == "__main__":
         "data_path": data_path
     }, allow_val_change=True)
 
-    dm = DataModule(json_path=json_path, base_dir=base_path, batch_size=batch_size, num_workers=num_workers)
+    dm = DataModule(json_path=json_path, data_dir=data_path, batch_size=batch_size, num_workers=num_workers)
     gc.collect()
     torch.cuda.empty_cache()
     trainer = pl.Trainer(
@@ -488,7 +498,7 @@ if __name__ == "__main__":
     # fit
     # -----------------------------
     # Load full checkpoint (resume training exactly where it left off)
-    # if pretrained_ckpt and os.path.exists(pretrained_ckpt):
+    # if pretrained_ckpt is not None and os.path.exists(pretrained_ckpt):
     #     print(f"Resuming training from: {pretrained_ckpt}")
     #     trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
     # else:
