@@ -21,8 +21,8 @@ In terminal/command line:
     python moco_main.py /path/to/base dataset run1 [run2]
 
 Arguments:
-    /path/to/base : base directory containing the script, dataset and trained_weights
-    dataset          : "dmri_dataset" or "fmri_dataset" depending on dataset type for training
+    /path/to/base : base directory containing the script and trained_weights
+    /path/to/data : dataset directory depending on dataset for training
     run1          : identifier for this training run (used in checkpoint filename)
     run2 (opt)    : if provided, fine-tune or continue from run1 but save under run2 name
 
@@ -60,15 +60,14 @@ if len(sys.argv) < 3:
     sys.exit(1)
 
 base_path = sys.argv[1]                          # e.g. /home/.../moco_dmri/
-data_subfolder = sys.argv[2]                     # e.g. fmri_dataset or dmri_dataset
+data_path = sys.argv[2]                     # e.g. fmri_dataset or dmri_dataset
 order_execution_1 = sys.argv[3]                  # run name
 order_execution_2 = sys.argv[4] if len(sys.argv) > 4 else None
 
-data_path = os.path.join(base_path, data_subfolder)
 json_path = os.path.join(data_path, "dataset.json")
 
 print("Base path   :", base_path)
-print("Data folder :", data_subfolder)
+print("Data folder :", data_path)
 print("JSON path   :", json_path)
 
 # -----------------------------
