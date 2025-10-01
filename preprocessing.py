@@ -9,7 +9,7 @@ For fMRI data   - Mean across time
                 - Mask creation
 
 Usage: in terminal/command line
-    python preprocess_data.py /path/to/data mode
+    python preprocessing.py /path/to/data mode
     - /path/to/data --> directory of dataset
     - mode --> dmri or fmri :depending on dataset
 """
@@ -191,7 +191,7 @@ def process_subject(target, mode):
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python preprocess_data.py <data_dir> <dwi|fmri>")
+        print("Usage: python preprocessing.py <data_dir> <dwi|fmri>")
         sys.exit(1)
 
     data_dir = sys.argv[1]
