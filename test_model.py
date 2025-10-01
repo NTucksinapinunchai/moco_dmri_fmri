@@ -1,3 +1,5 @@
+
+
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -10,7 +12,7 @@ torch.set_float32_matmul_precision("medium")
 
 import numpy as np
 import nibabel as nib
-from main import DataModule, VoxelMorphReg
+from moco_main import DataModule, VoxelMorphReg
 from skimage.exposure import match_histograms
 from nibabel.orientations import axcodes2ornt, io_orientation, ornt_transform, apply_orientation
 
