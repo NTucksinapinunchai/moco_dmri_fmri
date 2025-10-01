@@ -2,10 +2,30 @@
 """
 Created on Mon Sep 1 2025
 @author: Nontharat Tucksinapinunchai
-"""
-"""
-original VoxelmorphUNet no dropout, 4D moving +4D new fixed +mask, mix loss (1,1) across time, add flow_scale, normalized_volume with mask, lambda smooth=0.05
-no permutation, original size and intensity, resampling instead padding, save stage and weight
+
+This script used to train a deep learning model for motion correction in dMRI or fMRI.
+It uses a VoxelMorphUNet to register 4D moving volumes to a fixed reference guided by a mask.
+The model combines L2 (MSE) and GNCC losses across time, with smoothness regularization and flow scaling.
+
+Key features:
+- 4D moving + 4D fixed (dMRI) or 3D fixed (fMRI) + mask inputs
+- Mixed similarity loss (L2 + GNCC) across timepoints
+- Flow scaling and resampling make the input compatible to UNet architecture
+- Normalization inside mask using 1%–99% percentiles
+- Saves best weights, logs training/validation losses, and integrates with W&B
+
+Usage:
+------
+In terminal/command line:
+
+    python moco_main.py /path/to/base dataset run1 [run2]
+
+Arguments:
+    /path/to/base : base directory containing the script, dataset and trained_weights
+    dataset          : "dmri_dataset" or "fmri_dataset" depending on dataset type for training
+    run1          : identifier for this training run (used in checkpoint filename)
+    run2 (opt)    : if provided, fine-tune or continue from run1 but save under run2 name
+
 """
 
 import os
@@ -31,17 +51,31 @@ from monai.networks.blocks import Warp
 start_time = time.ctime()
 print("Start at:", start_time)
 
-base_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/"
-data_path = "/home/ge.polymtl.ca/p122983/nontharat/moco_dmri/fmri_dataset/"
-sys.path.insert(0,data_path)
-json_path = os.path.join(data_path, 'dataset.json')
+# -----------------------------
+# Parse CLI args
+# -----------------------------
+if len(sys.argv) < 3:
+    print("Usage: python main.py <base_path> <data_subfolder> <run_name1> [<run_name2>]")
+    print("Example: python main.py /path/to/project fmri_dataset run1 [run2]")
+    sys.exit(1)
+
+base_path = sys.argv[1]                          # e.g. /home/.../moco_dmri/
+data_subfolder = sys.argv[2]                     # e.g. fmri_dataset or dmri_dataset
+order_execution_1 = sys.argv[3]                  # run name
+order_execution_2 = sys.argv[4] if len(sys.argv) > 4 else None
+
+data_path = os.path.join(base_path, data_subfolder)
+json_path = os.path.join(data_path, "dataset.json")
+
+print("Base path   :", base_path)
+print("Data folder :", data_subfolder)
+print("JSON path   :", json_path)
 
 # -----------------------------
 # DataGenerator
 # -----------------------------
 class DataGenerator(Dataset):
     def __init__(self, file_list, base_dir):
-        # super().__init__(data=file_list)
         self.file_list = file_list
         self.base_dir = base_dir
 
@@ -53,8 +87,8 @@ class DataGenerator(Dataset):
         pt_path = os.path.join(self.base_dir, sample["data"])
         data = torch.load(pt_path, weights_only=False)
 
-        return {"moving": data["moving"], "fixed": data["fixed"], "mask": data["mask"], "affine": data["affine"],
-            "data_path": pt_path}
+        return {"moving": data["moving"], "fixed": data["fixed"], "mask": data["mask"],
+                "affine": data["affine"], "data_path": pt_path}
 
 # -----------------------------
 # DataModule
@@ -89,81 +123,10 @@ class DataModule(pl.LightningDataModule):
                           num_workers=self.num_workers, pin_memory=True, persistent_workers=True)
 
 # -----------------------------
-# Smoothness regularization
-# -----------------------------
-def gradient_loss(flow_5d: torch.Tensor) -> torch.Tensor:
-    dx = flow_5d[:, :, 1:, :, :] - flow_5d[:, :, :-1, :, :]
-    dy = flow_5d[:, :, :, 1:, :] - flow_5d[:, :, :, :-1, :]
-    dz = flow_5d[:, :, :, :, 1:] - flow_5d[:, :, :, :, :-1]
-
-    loss = (dx.pow(2).mean() +
-            dy.pow(2).mean() +
-            dz.pow(2).mean()) / 3.0
-    return loss
-
-# -----------------------------
-# L2 loss (MSE)
-# -----------------------------
-def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    B, C, H, W, D, T = warped_all.shape
-    losses = []
-    for t in range(T):
-        warped_t = warped_all[..., t]   # (B,1,H,W,D)
-        fixed_t = fixed[..., t]         # (B,1,H,W,D)
-        mask = mask                   # (B,1,H,W,D)
-
-        warped_n = normalize_volume(warped_t, mask)
-        fixed_n = normalize_volume(fixed_t, mask)
-
-        warped_masked = warped_n * mask
-        fixed_masked = fixed_n * mask
-
-        losses.append(F.mse_loss(warped_masked, fixed_masked))
-
-    return torch.stack(losses).mean()
-
-# -----------------------------
-# Global Normalized Cross-Correlation (GNCC)
-# -----------------------------
-def global_ncc(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    B, C, H, W, D, T = a.shape
-    ncc_vals = []
-
-    for t in range(T):
-        a_t = normalize_volume(a[..., t], mask)
-        b_t = normalize_volume(b[..., t], mask)
-        m_t = mask
-
-        a_t = a_t * m_t
-        b_t = b_t * m_t
-
-        a_mean = a_t.mean(dim=(2, 3, 4), keepdim=True)
-        b_mean = b_t.mean(dim=(2, 3, 4), keepdim=True)
-        a_t = a_t - a_mean
-        b_t = b_t - b_mean
-
-        num = (a_t * b_t).mean(dim=(2, 3, 4), keepdim=True)
-        den = torch.sqrt(
-            (a_t ** 2).mean(dim=(2, 3, 4), keepdim=True) *
-            (b_t ** 2).mean(dim=(2, 3, 4), keepdim=True)
-        ) + eps
-        ncc_vals.append(-(num / den).mean())
-
-    return torch.stack(ncc_vals).mean()
-
-# -----------------------------
 # Some helper function
 # -----------------------------
 def next_multiple(x, n=32):
     return ((int(x) + n - 1) // n) * n
-
-def compute_padding(H, W, D, n=32):
-    Hn, Wn, Dn = next_multiple(H, n), next_multiple(W, n), next_multiple(D, n)
-    ph, pw, pd = Hn - H, Wn - W, Dn - D
-    # For (B,C,H,W,D): pad order is (D_left,D_right, W_left,W_right, H_left,H_right)
-    pad = (0, pd, 0, pw, 0, ph)
-    return pad, (ph, pw, pd)
-
 
 def resample_to_multiple(x, multiple=32, mode="trilinear"):
     B, C, H, W, D = x.shape
@@ -178,7 +141,6 @@ def resample_to_multiple(x, multiple=32, mode="trilinear"):
         x_resampled = F.interpolate(x, size=(new_H, new_W, new_D),
                                     mode=mode)
     return x_resampled, (H, W, D)
-
 
 def resample_back(x, orig_size, mode="trilinear"):
     H, W, D = orig_size
@@ -234,8 +196,72 @@ def normalize_volume(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> 
 
     # Apply mask: keep normalized inside, zero outside
     out = torch.where(mask > 0, x_norm, torch.zeros_like(x))
+
     return out
 
+def _get_fixed_t(fixed: torch.Tensor, t: int) -> torch.Tensor:
+    # Returns (B,1,H,W,D) for time t, regardless of fixed being 3D or 4D
+    if fixed.ndim == 5:   # (B,1,H,W,D)
+        return fixed
+    elif fixed.ndim == 6: # (B,1,H,W,D,T)
+        return fixed[..., t]
+    else:
+        raise ValueError(f"Unexpected fixed ndim={fixed.ndim}")
+
+# -----------------------------
+# Smoothness regularization
+# -----------------------------
+def gradient_loss(flow_5d: torch.Tensor) -> torch.Tensor:
+    dx = flow_5d[:, :, 1:, :, :] - flow_5d[:, :, :-1, :, :]
+    dy = flow_5d[:, :, :, 1:, :] - flow_5d[:, :, :, :-1, :]
+    dz = flow_5d[:, :, :, :, 1:] - flow_5d[:, :, :, :, :-1]
+
+    loss = (dx.pow(2).mean() +
+            dy.pow(2).mean() +
+            dz.pow(2).mean()) / 3.0
+    return loss
+
+# -----------------------------
+# L2 loss (MSE)
+# -----------------------------
+def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    B, C, H, W, D, T = warped_all.shape
+    losses = []
+    for t in range(T):
+        warped_t = warped_all[..., t]        # (B,1,H,W,D)
+        fixed_t  = _get_fixed_t(fixed, t)    # (B,1,H,W,D)
+        mask_t   = mask                      # (B,1,H,W,D)
+
+        warped_n = normalize_volume(warped_t, mask_t) * mask_t
+        fixed_n  = normalize_volume(fixed_t,  mask_t) * mask_t
+        losses.append(F.mse_loss(warped_n, fixed_n))
+
+    return torch.stack(losses).mean()
+
+# -----------------------------
+# Global Normalized Cross-Correlation (GNCC)
+# -----------------------------
+def global_ncc(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    B, C, H, W, D, T = a.shape
+    vals = []
+    for t in range(T):
+        a_t = a[..., t]
+        b_t = _get_fixed_t(b, t)
+        m_t = mask
+
+        a_t = normalize_volume(a_t, m_t) * m_t
+        b_t = normalize_volume(b_t, m_t) * m_t
+
+        a_mean = a_t.mean(dim=(2,3,4), keepdim=True)
+        b_mean = b_t.mean(dim=(2,3,4), keepdim=True)
+        a0 = a_t - a_mean
+        b0 = b_t - b_mean
+
+        num = (a0 * b0).mean(dim=(2,3,4), keepdim=True)
+        den = torch.sqrt((a0**2).mean(dim=(2,3,4), keepdim=True) * (b0**2).mean(dim=(2,3,4), keepdim=True)) + eps
+        vals.append(-(num / den).mean())
+
+    return torch.stack(vals).mean()
 # -----------------------------
 # LightningModule
 # -----------------------------
@@ -256,24 +282,31 @@ class VoxelMorphReg(pl.LightningModule):
             # dropout=0.5
         )
         # Use border padding to reduce black edge artifacts
-        self.transformer = Warp(mode="bilinear", padding_mode="border")
+        self.transformer = Warp(mode="nearest", padding_mode="border")      # change from "bilinear" to observe over-smoothed effect
 
     def forward(self, moving, fixed, mask):
         """
-        moving: (B, 1, H, W, D, T)              # RAW (H,W,D ordering)
-        fixed:  (B, 1, H, W, D, T)              # RAW
+        moving: (B, 1, H, W, D, T)
+        fixed:  (B, 1, H, W, D) or (B, 1, H, W, D, T) --> the model will handle both 3D and 4D
+            - dMRI: (B,1,H,W,D,T) -> mean b0 and mean dwi over timepoints
+            - fMRI: (B,1,H,W,D)   -> static mean fMRI
         mask:  (B, 1, H, W, D)
         returns:
-          warped_all_raw: (B, 1, H, W, D, T)    # raw intensities preserved
+          warped_all_raw: (B, 1, H, W, D, T)
           flows_4d:       (B, 3, H, W, D, T)
         """
         B, C, H, W, D, T = moving.shape
-
         warped_list, flow_list = [], []
 
         for t in range(T):
             mov_t_raw = moving[..., t]  # (B,1,H,W,D)
-            fix_t_raw = fixed[..., t]  # reference (same for all t)
+            # Handle fixed: either 3D (fMRI) or 4D (dMRI)
+            if fixed.ndim == 5:  # (B,1,H,W,D)
+                fix_t_raw = fixed
+            elif fixed.ndim == 6:  # (B,1,H,W,D,T)
+                fix_t_raw = fixed[..., t]
+            else:
+                raise ValueError(f"Unexpected fixed ndim={fixed.ndim}")
             mask_raw = mask  # (B,1,H,W,D)
 
             # --- Resample all to multiples of 32 ---
@@ -374,9 +407,9 @@ class VoxelMorphReg(pl.LightningModule):
         }
 
 # -----------------------------
-# logger (Weights & Biases)
+# Training setup
 # -----------------------------
-num_epochs = 200
+num_epochs = 150
 batch_size = 1
 lr = 1e-4
 lambda_smooth = 0.05
@@ -385,12 +418,10 @@ num_workers = 8
 # -----------------------------
 # callbacks
 # -----------------------------
-order_execution_1 = sys.argv[1]
 ckpt_dir = os.path.join(base_path, 'trained_weights')
 os.makedirs(ckpt_dir, exist_ok=True)
 
-if len(sys.argv) > 2:
-    order_execution_2 = sys.argv[2]
+if order_execution_2:
     pretrained_ckpt = os.path.join(ckpt_dir, f"{order_execution_1}_voxelmorph_best-weighted.ckpt")
     ckpt_name = f"{order_execution_2}_voxelmorph_best-weighted"
 else:
@@ -407,24 +438,15 @@ checkpoint_cb = ModelCheckpoint(
 )
 
 lr_monitor = LearningRateMonitor(logging_interval="epoch")
-early_stop = EarlyStopping(
-    monitor="val_loss",
-    mode="min",
-    patience=25,
-    verbose=True
-)
+early_stop = EarlyStopping(monitor="val_loss", mode="min", patience=25, verbose=True)
 
 # Load only model weights (use checkpoint as initialization for a new run)
-# if os.path.exists(pretrained_ckpt):
-#     print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
-#     model = VoxelMorphReg.load_from_checkpoint(
-#         pretrained_ckpt,
-#         lr=lr,
-#         lambda_smooth=lambda_smooth
-#     )
-# else:
-#     print("No pretrained checkpoint found, training from scratch.")
-model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth)
+if os.path.exists(pretrained_ckpt):
+    print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
+    model = VoxelMorphReg.load_from_checkpoint(pretrained_ckpt, lr=lr, lambda_smooth=lambda_smooth)
+else:
+    print("No pretrained checkpoint found, training from scratch.")
+    model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth)
 
 # -----------------------------
 # trainer
@@ -434,9 +456,9 @@ if __name__ == "__main__":
     from pytorch_lightning.loggers import WandbLogger
 
     wandb.login(key="ab48d9c3a5dee9883bcb676015f2487c1bc51f74")
-    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_2}_VoxelMorphUNet")
+    wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}_VoxelMorphUNet")
     # If continue with the pretrained_ckpt, resume logs to the same wandb run
-    wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}_VoxelMorphUNet", id="36pzulfc", resume="must")
+    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}_VoxelMorphUNet", id="36pzulfc", resume="must")
     wandb_config = wandb_logger.experiment.config
     wandb_config.update({
         "num_epochs": num_epochs,
@@ -467,12 +489,12 @@ if __name__ == "__main__":
     # fit
     # -----------------------------
     # Load full checkpoint (resume training exactly where it left off)
-    if os.path.exists(pretrained_ckpt):
-        print(f"Resuming training from: {pretrained_ckpt}")
-        trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
-    else:
-        print("No checkpoint found, training from scratch.")
-        trainer.fit(model, datamodule=dm)
+    # if pretrained_ckpt and os.path.exists(pretrained_ckpt):
+    #     print(f"Resuming training from: {pretrained_ckpt}")
+    #     trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
+    # else:
+    #     print("No checkpoint found, training from scratch.")
+    trainer.fit(model, datamodule=dm)
 
     # -----------------------------
     # Best checkpoint info
