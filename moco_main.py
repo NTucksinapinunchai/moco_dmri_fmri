@@ -18,11 +18,11 @@ Usage:
 ------
 In terminal/command line:
 
-    python moco_main.py /path/to/base path/to/dataset run1 [run2]
+    python moco_main.py /path/to/base path/to/data run1 [run2]
 
 Arguments:
     /path/to/base       : base directory containing the script and trained_weights
-    /path/to/dataset    : dataset directory depending on dataset for training
+    /path/to/data    : data directory depending on training dataset
     run1                : identifier for this training run (checkpoint filename)
     run2 (opt)          : if provided, fine-tune or continue from run1 but save under run2 name
 
