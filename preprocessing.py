@@ -1,17 +1,31 @@
+# -*- coding: utf-8 -*-
 """
-Pre-processing script for dMRI and fMRI data using function of Spinal Cord Toolbox (SCT)
-For dMRI data   - Separate b0 and dwi
-                - Segmentation
-                - Mask creation
-                and duplicate mean b0 and mean dwi volumes into 4D (H,W,D,T)
-For fMRI data   - Mean across time
-                - Segmentation
-                - Mask creation
+Pre-processing script used to prepare the necessary files/data for motion correction training,
+separately handling dMRI and fMRI using functions from the Spinal Cord Toolbox (SCT).
 
-Usage: in terminal/command line
+Pipeline Overview:
+------------------
+For dMRI data:
+    - Separate b0 and dwi volumes to get mean b0 and mean dwi
+    - Perform spinal cord segmentation
+    - Create mask around the spinal cord
+    - Duplicate mean b0 and mean dwi volumes into a 4D fixed reference (H, W, D, T)
+
+For fMRI data:
+    - Compute mean across time to get mean fmri
+    - Perform spinal cord segmentation
+    - Create mask around the spinal cord
+    - Save mean fMRI as a 3D fixed reference
+
+Usage:
+------
+In terminal/command line:
+
     python preprocessing.py /path/to/data mode
-    - /path/to/data --> directory of dataset
-    - mode --> dmri or fmri :depending on dataset
+
+Arguments:
+    /path/to/data : data directory for training dataset preparation
+    mode          : 'dmri' or 'fmri' depending on dataset type
 """
 
 import os
@@ -21,38 +35,54 @@ import subprocess
 import numpy as np
 import nibabel as nib
 
+from config_loader import config
+
 def process_subject(target, mode):
     print(f"\nProcessing {target} in {mode.upper()} mode ...")
 
+    patterns = config[mode]
+    subdir = patterns["subdir"]
+
+    # ---------------------------
+    # Find raw NIfTI
+    # ---------------------------
+    nii_files = glob.glob(os.path.join(target, subdir, patterns["raw"]))
+    if not nii_files:
+        print(f"No {mode} NIfTI found in {target}")
+        return
+    input_img = nii_files[0]
+    nii = nib.load(input_img)
+    T = nii.shape[3]
+    print("Found NIfTI:", input_img)
+
+    # prefix (sub or sub+ses)
+    root = os.path.basename(input_img)
+    parts = root.split("_")
+    if len(parts) > 1 and parts[1].startswith("ses-"):
+        prefix = "_".join(parts[:2])
+    else:
+        prefix = parts[0]
+
     if mode == "dmri":
         # ---------------------------
-        # Find NIfTI + bvec + bval
+        # Find bvec + bval
         # ---------------------------
-        nii_files = glob.glob(os.path.join(target, "dwi", "sub-*dwi.nii.gz"))
-        if not nii_files:
-            print(f"No dwi NIfTI found in {target}")
-            return
-        input_img = nii_files[0]
-        nii = nib.load(input_img)
-        T = nii.shape[3]
-        print("Found NIfTI:", input_img)
-
-        bvec_files = glob.glob(os.path.join(target, "dwi", "*.bvec"))
+        bvec_files = glob.glob(os.path.join(target, subdir, "*.bvec"))
         if not bvec_files:
             print(f"No bvec file found in {target}")
             return
         bvec_file = bvec_files[0]
 
-        bval_files = glob.glob(os.path.join(target, "dwi", "*.bval"))
+        bval_files = glob.glob(os.path.join(target, subdir, "*.bval"))
         if not bval_files:
             print(f"No bval file found in {target}")
             return
         bval_file = bval_files[0]
 
-        out_dir = os.path.join(target, "dwi")
+        out_dir = os.path.join(target, subdir)
 
         # ---------------------------
-        # Separate b0 and dwi
+        # Separate b0 and dwi to get mean dwi
         # ---------------------------
         SCT_SEP = [
             "sct_dmri_separate_b0_and_dwi",
@@ -65,7 +95,7 @@ def process_subject(target, mode):
         print("Separation Success!")
 
         # mean dwi
-        nii_files = glob.glob(os.path.join(target, "dwi", "sub-*dwi_mean.nii.gz"))
+        nii_files = glob.glob(os.path.join(out_dir, "*dwi_mean.nii.gz"))
         if not nii_files:
             print(f"No mean dwi found in {target}")
             return
@@ -73,28 +103,8 @@ def process_subject(target, mode):
         print("Found mean dwi:", mean_img)
 
     elif mode == "fmri":
-        # ---------------------------
-        # Find NIfTI
-        # ---------------------------
-        nii_files = glob.glob(os.path.join(target, "func", "sub-*bold.nii.gz"))
-        if not nii_files:
-            print(f"No fMRI NIfTI found in {target}")
-            return
-        input_img = nii_files[0]
-        nii = nib.load(input_img)
-        T = nii.shape[3]
-        print("Found NIfTI:", input_img)
-
-        root = os.path.basename(input_img)
-        parts = root.split("_")
-        if len(parts) > 1 and parts[1].startswith("ses-"):
-            prefix = "_".join(parts[:2])
-        else:
-            prefix = parts[0]
-
-        func_dir = os.path.join(target, "func")
-        mean_img = os.path.join(func_dir, f"{prefix}_fmri_mean.nii.gz")
-        out_dir = os.path.join(target, "func")
+        out_dir = os.path.join(target, subdir)
+        mean_img = os.path.join(out_dir, f"{prefix}_fmri_mean.nii.gz")
 
         # ---------------------------
         # Mean fMRI across time
@@ -105,7 +115,7 @@ def process_subject(target, mode):
             "-mean", "t",
             "-o", mean_img
         ]
-        subprocess.run(SCT_MATH, check=True, cwd=func_dir)
+        subprocess.run(SCT_MATH, check=True, cwd=out_dir)
         print("Mean Success!")
 
     else:
@@ -119,12 +129,8 @@ def process_subject(target, mode):
         "spinalcord",
         "-i", mean_img,
     ]
-
-    try:
-        subprocess.run(SCT_SEG, check=True)
-        print("Segmentation Success!")
-    except subprocess.CalledProcessError as e:
-        print("Error", e)
+    subprocess.run(SCT_SEG, check=True)
+    print("Segmentation Success!")
 
     # segmentation output
     seg_files = glob.glob(os.path.join(os.path.dirname(mean_img), "*seg.nii.gz"))
@@ -134,7 +140,7 @@ def process_subject(target, mode):
     seg_img = seg_files[0]
 
     # ---------------------------
-    # Create MASK along spinal cord
+    # Create MASK along the spinal cord
     # ---------------------------
     SCT_MASK = [
         "sct_create_mask",
@@ -142,18 +148,14 @@ def process_subject(target, mode):
         "-p", f"centerline,{seg_img}",
         "-size", "35mm"
     ]
-
-    try:
-        subprocess.run(SCT_MASK, check=True, cwd=out_dir)
-        print("Mask Success!")
-    except subprocess.CalledProcessError as e:
-        print("Error", e)
+    subprocess.run(SCT_MASK, check=True, cwd=out_dir)
+    print("Mask Success!")
 
     # ---------------------------
-    # Duplicate along time point
+    # Create fixed volume reference --> 4D for dMRI, 3D for fMRI
     # ---------------------------
     if mode == "dmri":
-        nii_files = glob.glob(os.path.join(target, "dwi", "sub-*b0_mean.nii.gz"))
+        nii_files = glob.glob(os.path.join(target, subdir, "*b0_mean.nii.gz"))
         if not nii_files:
             print(f"No mean b0 found in {target}")
             return
@@ -167,6 +169,9 @@ def process_subject(target, mode):
         mean_dwi_data = nib.load(mean_img).get_fdata()
         bvals = np.loadtxt(bval_file)
 
+        # ---------------------------
+        # Duplicate along time point (mean b0 where b0s are and mean dwi for the others)
+        # ---------------------------
         corrected = np.zeros_like(data)
         for t in range(T):
             if bvals[t] < 50:  # b0
@@ -174,8 +179,7 @@ def process_subject(target, mode):
             else:  # dwi
                 corrected[..., t] = mean_dwi_data
 
-        basename_noext = os.path.basename(input_img).replace("_dwi.nii.gz", "")
-        out_corrected = os.path.join(target, "dwi", f"dup_{basename_noext}_fixed.nii.gz")
+        out_corrected = os.path.join(target, subdir, f"dup_{prefix}_fixed.nii.gz")
         nib.save(nib.Nifti1Image(corrected, affine, header), out_corrected)
         print("Saved corrected file:", out_corrected)
 
@@ -184,14 +188,17 @@ def process_subject(target, mode):
         header = nii.header
         mean_fmri_data = nib.load(mean_img).get_fdata()
 
+        # ---------------------------
         # Save only the mean fMRI as 3D fixed reference
-        out_fixed = os.path.join(target, "func", f"{prefix}_fixed.nii.gz")
+        # ---------------------------
+        out_fixed = os.path.join(target, subdir, f"{prefix}_fixed.nii.gz")
         nib.save(nib.Nifti1Image(mean_fmri_data, affine, header), out_fixed)
         print("Saved fixed file:", out_fixed)
 
+
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python preprocessing.py <data_dir> <dwi|fmri>")
+        print("Usage: python preprocessing.py <data_dir> <dmri|fmri>")
         sys.exit(1)
 
     data_dir = sys.argv[1]
