@@ -168,6 +168,9 @@ def main(base_dir, mode):
     for split in ["training", "validation", "testing"]:
         print(f"Number of {split} pairs: {len(dataset_dict[split])}")
 
+# -----------------------------
+# CLI
+# -----------------------------
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python dataset_preparation.py <data_dir> <dmri|fmri>")

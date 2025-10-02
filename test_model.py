@@ -1,6 +1,28 @@
+# -*- coding: utf-8 -*-
 """
-Inference script for motion correction model (VoxelMorphReg).
-Loads raw NIfTI (moving, fixed, mask) directly instead of .pt/.json.
+Inference script used to generate the motion-corrected 4D volumes from VoxelMorphReg model.
+
+This script loads raw NIfTI files (moving, fixed, mask) directly and applies the
+trained VoxelMorphReg checkpoint to perform motion correction. It outputs the corrected
+4D volume as well as the displacement fields along each axis (dx, dy, dz).
+
+Features:
+---------
+- Supports both dMRI and fMRI datasets (detected automatically from input path).
+- Loads moving/fixed/mask volumes from BIDS-like folder structure.
+- Performs inference with the trained checkpoint.
+- Saves motion-corrected volumes and displacement fields as NIfTI files.
+- Reports inference timing statistics across subjects.
+
+Usage:
+------
+In terminal/command line:
+
+    python test_model.py /path/to/data trained_weight
+
+Arguments:
+    /path/to/data   : directory of prepared dataset
+    trained_weight  : run name or checkpoint identifier (without .ckpt extension)
 """
 
 import os
@@ -26,7 +48,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Main inference
 # -----------------------------
 def main(data_dir, run_name):
-    ckpt_path = os.path.join(os.path.dirname(data_dir), "trained_weights", run_name)
+    """
+    Run inference on all subjects/sessions and save corrected volumes + flows.
+    """
+    ckpt_path = os.path.join(os.path.dirname(data_dir), "trained_weights", f"{trained_weight}.ckpt")
 
     # -----------------------------
     # Load model
@@ -117,7 +142,10 @@ def main(data_dir, run_name):
             # histogram matching
             matched = np.zeros_like(warped)
             for t in range(warped.shape[-1]):
-                matched[..., t] = match_histograms(warped[..., t], ref_data[..., t])
+                if ref_data.ndim == 4:
+                    matched[..., t] = match_histograms(warped[..., t], ref_data[..., t])
+                else:
+                    matched[..., t] = match_histograms(warped[..., t], ref_data)
 
             # -----------------------------
             # Save the output
@@ -147,9 +175,9 @@ def main(data_dir, run_name):
 # -----------------------------
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python test_model.py <data_dir> <run_name>")
+        print("Usage: python test_model.py <data_dir> <trained_weight>")
         sys.exit(1)
 
     data_dir = sys.argv[1]
-    run_name = sys.argv[2]
-    main(data_dir, run_name)
+    trained_weight = sys.argv[2]
+    main(data_dir, trained_weight)

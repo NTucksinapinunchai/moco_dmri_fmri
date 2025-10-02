@@ -138,6 +138,9 @@ def main(data_dir, mode):
             # run augmentation
             augment_data(input_img, output_img, slicewise_tf)
 
+# -----------------------------
+# CLI
+# -----------------------------
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python augmentation.py <data_dir> <dmri|fmri>")

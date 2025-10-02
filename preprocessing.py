@@ -195,7 +195,9 @@ def process_subject(target, mode):
         nib.save(nib.Nifti1Image(mean_fmri_data, affine, header), out_fixed)
         print("Saved fixed file:", out_fixed)
 
-
+# -----------------------------
+# CLI
+# -----------------------------
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python preprocessing.py <data_dir> <dmri|fmri>")
