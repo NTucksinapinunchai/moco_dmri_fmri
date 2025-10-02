@@ -8,9 +8,9 @@ It uses a VoxelMorphUNet to register 4D moving volumes to a fixed reference guid
 The model combines L2 (MSE) and GNCC losses across time, with smoothness regularization and flow scaling.
 
 Key features:
-- 4D moving + 4D fixed (dMRI) or 3D fixed (fMRI) + mask inputs
-- Mixed similarity loss (L2 + GNCC) across timepoints
-- Flow scaling and resampling make the input compatible to UNet architecture
+- Handles both 4D moving + 4D fixed (dMRI) or 4D moving + 3D fixed (fMRI) with mask inputs
+- Mixed similarity loss (L2 + GNCC) computed across timepoints
+- Flow scaling and resampling to make input compatible with UNet architecture
 - Normalization inside mask using 1%–99% percentiles
 - Saves best weights, logs training/validation losses, and integrates with W&B
 
@@ -18,13 +18,13 @@ Usage:
 ------
 In terminal/command line:
 
-    python moco_main.py /path/to/base dataset run1 [run2]
+    python moco_main.py /path/to/base path/to/dataset run1 [run2]
 
 Arguments:
-    /path/to/base : base directory containing the script and trained_weights
-    /path/to/data : dataset directory depending on dataset for training
-    run1          : identifier for this training run (used in checkpoint filename)
-    run2 (opt)    : if provided, fine-tune or continue from run1 but save under run2 name
+    /path/to/base       : base directory containing the script and trained_weights
+    /path/to/dataset    : dataset directory depending on dataset for training
+    run1                : identifier for this training run (checkpoint filename)
+    run2 (opt)          : if provided, fine-tune or continue from run1 but save under run2 name
 
 """
 
@@ -37,6 +37,7 @@ import sys
 import time
 import torch
 torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
 
 import json
 import pytorch_lightning as pl
@@ -61,8 +62,8 @@ if len(sys.argv) < 3:
 
 base_path = sys.argv[1]                          # e.g. /home/.../moco_dmri/
 data_path = sys.argv[2]                          # e.g. /home/.../prepared/dmri_dataset
-order_execution_1 = sys.argv[3]                  # run name
-order_execution_2 = sys.argv[4] if len(sys.argv) > 4 else None
+order_execution_1 = sys.argv[3]                  # run name e.g. yyyymmdd_order_voxelmorph_best-weighted
+order_execution_2 = sys.argv[4] if len(sys.argv) > 4 else None      # format like order_execution_1
 
 json_path = os.path.join(data_path, "dataset.json")
 
@@ -96,8 +97,24 @@ class DataGenerator(Dataset):
 
         data = torch.load(final_path, weights_only=False)
 
-        return {"moving": data["moving"], "fixed": data["fixed"], "mask": data["mask"],
-                "affine": data["affine"], "data_path": pt_path}
+        moving = data["moving"]  # (B,1,H,W,D,T)
+        fixed = data["fixed"]  # (B,1,H,W,D) [fMRI] or (B,1,H,W,D,T) [dMRI]
+        mask = data["mask"]
+        affine = data["affine"]
+
+        # --- Only apply subsampling if fMRI ---
+        if fixed.ndim == 5:  # fMRI case
+            T = moving.shape[-1]
+            max_T = max(100, T//2)
+            if T > max_T:
+                step = T // max_T
+                idxs = torch.arange(0, T, step)[:max_T]
+
+                # subsample only moving (fixed stays as static reference)
+                moving = moving[..., idxs]
+
+        return {"moving": moving, "fixed": fixed, "mask": mask,
+                "affine": affine, "data_path": pt_path}
 
 # -----------------------------
 # DataModule
@@ -134,10 +151,10 @@ class DataModule(pl.LightningDataModule):
 # -----------------------------
 # Some helper function
 # -----------------------------
-def next_multiple(x, n=32):
-    return ((int(x) + n - 1) // n) * n
-
 def resample_to_multiple(x, multiple=32, mode="trilinear"):
+    """
+    Resample tensor to nearest multiple of given size using interpolation.
+    """
     B, C, H, W, D = x.shape
     new_H = ((H + multiple - 1) // multiple) * multiple
     new_W = ((W + multiple - 1) // multiple) * multiple
@@ -152,6 +169,9 @@ def resample_to_multiple(x, multiple=32, mode="trilinear"):
     return x_resampled, (H, W, D)
 
 def resample_back(x, orig_size, mode="trilinear"):
+    """
+    Resample tensor back to original size after UNet processing.
+    """
     H, W, D = orig_size
     if mode in ["trilinear", "bilinear", "linear"]:
         return F.interpolate(x, size=(H, W, D), mode=mode, align_corners=False)
@@ -159,6 +179,9 @@ def resample_back(x, orig_size, mode="trilinear"):
         return F.interpolate(x, size=(H, W, D), mode=mode)
 
 def resample_flow_back(flow, orig_size, resampled_size, mode="trilinear"):
+    """
+    Resample and scale flow fields back to original resolution.
+    """
     H, W, D = orig_size
     Hres, Wres, Dres = resampled_size
 
@@ -209,10 +232,13 @@ def normalize_volume(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> 
     return out
 
 def _get_fixed_t(fixed: torch.Tensor, t: int) -> torch.Tensor:
-    # Returns (B,1,H,W,D) for time t, regardless of fixed being 3D or 4D
-    if fixed.ndim == 5:   # (B,1,H,W,D)
-        return fixed
-    elif fixed.ndim == 6: # (B,1,H,W,D,T)
+    """
+    Return fixed volume (B,1,H,W,D) at time t,
+    supporting both 3D fixed (fMRI) and 4D fixed (dMRI).
+    """
+    if fixed.ndim == 5:             # (B,1,H,W,D)
+        return fixed.detach()       # same ref for all timepoints, no gradient
+    elif fixed.ndim == 6:           # (B,1,H,W,D,T)
         return fixed[..., t]
     else:
         raise ValueError(f"Unexpected fixed ndim={fixed.ndim}")
@@ -221,6 +247,9 @@ def _get_fixed_t(fixed: torch.Tensor, t: int) -> torch.Tensor:
 # Smoothness regularization
 # -----------------------------
 def gradient_loss(flow_5d: torch.Tensor) -> torch.Tensor:
+    """
+    Compute smoothness regularization loss on flow fields (dx,dy,dz).
+    """
     dx = flow_5d[:, :, 1:, :, :] - flow_5d[:, :, :-1, :, :]
     dy = flow_5d[:, :, :, 1:, :] - flow_5d[:, :, :, :-1, :]
     dz = flow_5d[:, :, :, :, 1:] - flow_5d[:, :, :, :, :-1]
@@ -234,6 +263,12 @@ def gradient_loss(flow_5d: torch.Tensor) -> torch.Tensor:
 # L2 loss (MSE)
 # -----------------------------
 def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Compute L2 loss across timepoints, inside the mask.
+        warped_all: (B,1,H,W,D,T)
+        fixed:      (B,1,H,W,D,T)
+        mask:       (B,1,H,W,D)
+    """
     B, C, H, W, D, T = warped_all.shape
     losses = []
     for t in range(T):
@@ -251,6 +286,11 @@ def l2_loss(warped_all: torch.Tensor, fixed: torch.Tensor, mask: torch.Tensor, e
 # Global Normalized Cross-Correlation (GNCC)
 # -----------------------------
 def global_ncc(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Compute Global normalized cross-correlation across timepoints.
+        a, b:   (B,1,H,W,D,T)
+        mask:   (B,1,H,W,D)
+    """
     B, C, H, W, D, T = a.shape
     vals = []
     for t in range(T):
@@ -297,8 +337,8 @@ class VoxelMorphReg(pl.LightningModule):
         """
         moving: (B, 1, H, W, D, T)
         fixed:  (B, 1, H, W, D) or (B, 1, H, W, D, T) --> the model will handle both 3D and 4D
-            - dMRI: (B,1,H,W,D,T) -> mean b0 and mean dwi over timepoints
-            - fMRI: (B,1,H,W,D)   -> static mean fMRI
+                - dMRI: (B,1,H,W,D,T) -> mean b0 and mean dwi over timepoints
+                - fMRI: (B,1,H,W,D)   -> static mean fMRI
         mask:  (B, 1, H, W, D)
         returns:
           warped_all_raw: (B, 1, H, W, D, T)
@@ -307,47 +347,57 @@ class VoxelMorphReg(pl.LightningModule):
         B, C, H, W, D, T = moving.shape
         warped_list, flow_list = [], []
 
-        for t in range(T):
-            mov_t_raw = moving[..., t]  # (B,1,H,W,D)
-            # Handle fixed: either 3D (fMRI) or 4D (dMRI)
-            if fixed.ndim == 5:  # (B,1,H,W,D)
-                fix_t_raw = fixed
-            elif fixed.ndim == 6:  # (B,1,H,W,D,T)
-                fix_t_raw = fixed[..., t]
-            else:
-                raise ValueError(f"Unexpected fixed ndim={fixed.ndim}")
-            mask_raw = mask  # (B,1,H,W,D)
+        # Precompute mask once
+        mask_res, _ = resample_to_multiple(mask, multiple=32, mode="nearest")
+        mask_bin = (mask_res > 0.5).float()
 
-            # --- Resample all to multiples of 32 ---
+        for t in range(T):
+            mov_t_raw = moving[..., t]          # (B,1,H,W,D)
+            fix_t_raw = _get_fixed_t(fixed, t)  # fMRI → static or dMRI → time-varying
+
+            # Resample to make a compatible shape
             mov_t_res, orig_size = resample_to_multiple(mov_t_raw, multiple=32, mode="trilinear")
             fix_t_res, _ = resample_to_multiple(fix_t_raw, multiple=32, mode="trilinear")
-            mask_res, _ = resample_to_multiple(mask_raw, multiple=32, mode="nearest")
 
-            resampled_size = mov_t_res.shape[2:]  # (Hres, Wres, Dres)
-            mask_bin = (mask_res > 0.5).float()
+            # Downsample before UNet
+            mov_t_ds = F.interpolate(mov_t_res, scale_factor=0.5, mode="trilinear", align_corners=False)
+            fix_t_ds = F.interpolate(fix_t_res, scale_factor=0.5, mode="trilinear", align_corners=False)
+            mask_ds = F.interpolate(mask_res, scale_factor=0.5, mode="nearest")
 
-            # ---- Normalize per timepoint ----
-            mov_t_norm = normalize_volume(mov_t_res, mask=mask_bin) * mask_bin
-            fix_t_norm = normalize_volume(fix_t_res, mask=mask_bin) * mask_bin
+            mask_bin_ds = (mask_ds > 0.5).float()
+
+            # Normalize inside mask
+            mov_t_norm = normalize_volume(mov_t_ds, mask=mask_bin_ds) * mask_bin_ds
+            fix_t_norm = normalize_volume(fix_t_ds, mask=mask_bin_ds) * mask_bin_ds
 
             # UNet input
-            x = torch.cat([mov_t_norm, fix_t_norm], dim=1)  # (B,2,H',W',D')
+            x = torch.cat([mov_t_norm, fix_t_norm], dim=1)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                flow_ds = self.unet(x)
+            flow_ds = torch.tanh(flow_ds) * self.flow_scale
 
-            flow_res = self.unet(x)
-            flow_res = torch.tanh(flow_res) * self.flow_scale
+            # Warp moving
+            warped_ds = self.transformer(mov_t_ds, flow_ds)
 
-            # Warp raw moving (not normalized!)
-            warped_res = self.transformer(mov_t_res, flow_res)
+            # Upsample back to original resolution
+            warped_res = F.interpolate(warped_ds, size=mov_t_res.shape[2:], mode="trilinear", align_corners=False)
+            flow_res = F.interpolate(flow_ds, size=mov_t_res.shape[2:], mode="trilinear", align_corners=False)
 
-            # --- Resample back to original size ---
+            # Back to exact original size
             warped_back = resample_back(warped_res, orig_size, mode="trilinear")
-            flow_back   = resample_flow_back(flow_res, orig_size, resampled_size, mode="trilinear")
+            flow_back = resample_flow_back(flow_res, orig_size, mov_t_res.shape[2:], mode="trilinear")
 
             warped_list.append(warped_back)
             flow_list.append(flow_back)
 
-        warped_all = torch.stack(warped_list, dim=-1)       # (B,1,H,W,D,T)
-        flows_4d = torch.stack(flow_list, dim=-1)           # (B,3,H,W,D,T)
+            # free intermediates early
+            del mov_t_raw, fix_t_raw, mov_t_res, fix_t_res
+            del mov_t_ds, fix_t_ds, warped_ds, flow_ds, warped_res, flow_res
+            torch.cuda.empty_cache()
+
+        warped_all = torch.stack(warped_list, dim=-1)   # (B,1,H,W,D,T)
+        flows_4d = torch.stack(flow_list, dim=-1)       # (B,3,H,W,D,T)
+
         return warped_all, flows_4d
 
     def training_step(self, batch, batch_idx):
@@ -361,8 +411,8 @@ class VoxelMorphReg(pl.LightningModule):
         B, _, H, W, D, T = warped_all.shape
         loss_smooth = 0.0
         for t in range(T):
-            flow_t = flows_4d[..., t]  # (B,3,H,W,D)
-            loss_smooth = loss_smooth + gradient_loss(flow_t).float()
+            flow_t = flows_4d[..., t]
+            loss_smooth = loss_smooth + gradient_loss(flow_t)
         loss_smooth = loss_smooth / T
 
         loss = loss_ncc + self.lambda_smooth * loss_smooth
@@ -373,32 +423,37 @@ class VoxelMorphReg(pl.LightningModule):
         self.log("train_sim_loss", loss_sim, batch_size=B)
         self.log("train_smooth_loss", loss_smooth, batch_size=B)
 
+        del warped_all, flows_4d
+        torch.cuda.empty_cache()
         return loss
 
     def validation_step(self, batch, batch_idx):
-        moving, fixed, mask = batch["moving"], batch["fixed"], batch["mask"]
-        warped_all, flows_4d = self(moving, fixed, mask)
+        with torch.no_grad():
+            moving, fixed, mask = batch["moving"], batch["fixed"], batch["mask"]
+            warped_all, flows_4d = self(moving, fixed, mask)
 
-        loss_l2 = l2_loss(warped_all, fixed, mask)
-        loss_ncc = global_ncc(warped_all, fixed, mask)
-        loss_sim = 1 * loss_l2 + 1 * loss_ncc
+            loss_l2 = l2_loss(warped_all, fixed, mask)
+            loss_ncc = global_ncc(warped_all, fixed, mask)
+            loss_sim = 1 * loss_l2 + 1 * loss_ncc
 
-        B, _, H, W, D, T = warped_all.shape
-        loss_smooth = 0.0
-        for t in range(T):
-            flow_t = flows_4d[..., t]  # (B,3,H,W,D)
-            loss_smooth = loss_smooth + gradient_loss(flow_t).float()
-        loss_smooth = loss_smooth / T
+            B, _, H, W, D, T = warped_all.shape
+            loss_smooth = 0.0
+            for t in range(T):
+                flow_t = flows_4d[..., t]
+                loss_smooth = loss_smooth + gradient_loss(flow_t)
+            loss_smooth = loss_smooth / T
 
-        loss = loss_ncc + self.lambda_smooth * loss_smooth
+            loss = loss_ncc + self.lambda_smooth * loss_smooth
 
-        self.log("val_loss", loss, prog_bar=True, batch_size=B)
-        self.log("val_l2_loss", loss_l2, batch_size=B)
-        self.log("val_ncc_loss", loss_ncc, batch_size=B)
-        self.log("val_sim_loss", loss_sim, batch_size=B)
-        self.log("val_smooth_loss", loss_smooth, batch_size=B)
+            self.log("val_loss", loss, prog_bar=True, batch_size=B)
+            self.log("val_l2_loss", loss_l2, batch_size=B)
+            self.log("val_ncc_loss", loss_ncc, batch_size=B)
+            self.log("val_sim_loss", loss_sim, batch_size=B)
+            self.log("val_smooth_loss", loss_smooth, batch_size=B)
 
-        return loss
+            del warped_all, flows_4d
+            torch.cuda.empty_cache()
+            return loss
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.lr)
@@ -418,7 +473,7 @@ class VoxelMorphReg(pl.LightningModule):
 # -----------------------------
 # Training setup
 # -----------------------------
-num_epochs = 150
+num_epochs = 50
 batch_size = 1
 lr = 1e-4
 lambda_smooth = 0.01
@@ -431,11 +486,11 @@ ckpt_dir = os.path.join(base_path, 'trained_weights')
 os.makedirs(ckpt_dir, exist_ok=True)
 
 if order_execution_2:
-    pretrained_ckpt = os.path.join(ckpt_dir, f"{order_execution_1}_voxelmorph_best-weighted.ckpt")
-    ckpt_name = f"{order_execution_2}_voxelmorph_best-weighted"
+    pretrained_ckpt = os.path.join(ckpt_dir, f"{order_execution_1}.ckpt")
+    ckpt_name = f"{order_execution_2}"
 else:
     pretrained_ckpt = None
-    ckpt_name = f"{order_execution_1}_voxelmorph_best-weighted"
+    ckpt_name = f"{order_execution_1}"
 
 checkpoint_cb = ModelCheckpoint(
     dirpath=ckpt_dir,
@@ -465,9 +520,9 @@ if __name__ == "__main__":
     from pytorch_lightning.loggers import WandbLogger
 
     wandb.login(key="ab48d9c3a5dee9883bcb676015f2487c1bc51f74")
-    wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}_VoxelMorphUNet")
+    wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}")
     # If continue with the pretrained_ckpt, resume logs to the same wandb run
-    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}_VoxelMorphUNet", id="36pzulfc", resume="must")
+    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_2}", id="x0u9ms56", resume="must")
     wandb_config = wandb_logger.experiment.config
     wandb_config.update({
         "num_epochs": num_epochs,
@@ -495,10 +550,10 @@ if __name__ == "__main__":
     )
 
     # -----------------------------
-    # fit
+    # Fit model
     # -----------------------------
     # Load full checkpoint (resume training exactly where it left off)
-    # if pretrained_ckpt is not None and os.path.exists(pretrained_ckpt):
+    # if os.path.exists(pretrained_ckpt):
     #     print(f"Resuming training from: {pretrained_ckpt}")
     #     trainer.fit(model, datamodule=dm, ckpt_path=pretrained_ckpt)
     # else:
