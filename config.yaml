@@ -1,4 +1,13 @@
-# config filename patterns, make the script automatically find necessary files for the model.
+# Configuration file defining filename patterns for dMRI and fMRI datasets.
+# This allows all scripts to automatically locate moving, fixed, mask, and raw NIfTI files in a BIDS-like structure.
+#
+# Keys:
+#   raw    : pattern for original input file
+#   moving : pattern for augmented moving image
+#   fixed  : pattern for fixed reference
+#   mask   : pattern for spinal cord mask
+#   subdir : subfolder containing the files (e.g., dwi/ or func/)
+#   suffix : suffix used in output filenames
 
 dmri:
   raw: "sub-*dwi.nii.gz"
