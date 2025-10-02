@@ -1,11 +1,33 @@
+# -*- coding: utf-8 -*-
 """
-Preparation script used to create dataset.json of dMRI and fMRI dataset for training/validation the DL model.
-- the script will convert nifti file into tensor in .pt for training and validation purposes
+Preparation script used to build dataset.json for dMRI and fMRI datasets to be used in
+training/validation of the DL motion correction model.
 
-Usage: in terminal/command line
-    python dataset_preparation.py /path/to/dataset mode
-    - /path/to/data --> directory of dataset
-    - mode --> dmri or fmri :depending on dataset
+This script converts NIfTI files into PyTorch tensors (.pt), organizes them into
+train/val/test splits, and generates a JSON index compatible with the training pipeline.
+
+Overview:
+---------
+1. For each subject/session:
+    - Identify moving, fixed, and mask NIfTI files (according to mode: dmri or fmri).
+    - Convert them into PyTorch tensors with an added channel dimension.
+    - Save as paired .pt files including affine matrix.
+    - Copy original NIfTI files into the prepared structure.
+2. Split subjects into:
+    - Training (80%)
+    - Validation (10%)
+    - Testing (10%)
+3. Save `dataset.json` with relative paths to .pt files.
+
+Usage:
+------
+In terminal/command line:
+
+    python dataset_preparation.py /path/to/data mode
+
+Arguments:
+    /path/to/data    : data directory for training dataset preparation
+    mode             : 'dmri' or 'fmri' depending on dataset type
 """
 
 import os
@@ -18,11 +40,15 @@ import numpy as np
 import nibabel as nib
 
 from glob import glob
+from config_loader import config
 
 # -----------------------------
 # Helper: load NIfTI → torch
 # -----------------------------
 def load_as_tensor(nii_path, add_channel=True):
+    """
+    Load NIfTI file and return as PyTorch tensor.
+    """
     img = nib.load(nii_path)
     data = img.get_fdata().astype(np.float32)
     tensor = torch.from_numpy(data)
@@ -34,45 +60,28 @@ def load_as_tensor(nii_path, add_channel=True):
 # Build dataset entries
 # -----------------------------
 def build_entries(subject_list, split_name, base_dir, target_dir, mode):
+    """
+    Build dataset entries for given subjects and save paired .pt files.
+    """
     entries = []
-    dataset_root = f"{mode}_dataset"
+    patterns = config[mode]
+
     for sub_ses in subject_list:
         if "_ses-" in sub_ses:
             sub, ses = sub_ses.split("_", 1)
-            if mode == "dmri":
-                data_folder = os.path.join(base_dir, sub, ses, "dwi")
-            else: # fmri
-                data_folder = os.path.join(base_dir, sub, ses, "func")
+            data_folder = os.path.join(base_dir, sub, ses, patterns["subdir"])
             out_sub = sub_ses
         else:
             sub = sub_ses
-            if mode == "dmri":
-                data_folder = os.path.join(base_dir, sub, "dwi")
-            else: # fmri
-                data_folder = os.path.join(base_dir, sub, "func")
+            data_folder = os.path.join(base_dir, sub, patterns["subdir"])
             out_sub = sub
 
-        # ---------------------------
-        # File patterns
-        # ---------------------------
-        if mode == "dmri":
-            moving_files = glob(os.path.join(data_folder, "aug_*dwi.nii.gz"))
-        else:  # fmri
-            moving_files = glob(os.path.join(data_folder, "aug_*bold.nii.gz"))
+        moving_files = glob(os.path.join(data_folder, patterns["moving"]))
 
         for moving_path in moving_files:
-            if mode == "dmri":
-                fixed_path = moving_path.replace("aug_", "dup_").replace("_dwi.nii.gz", "_fixed.nii.gz")
-                mask_files = glob(os.path.join(data_folder, "mask_*.nii.gz"))
-                mask_path = mask_files[0]
-                out_folder = os.path.join(target_dir, "dmri_dataset", split_name, out_sub, "dwi")
-                extra_pattern = os.path.join(data_folder, f"{sub}_dwi.nii.gz")
-            else:  # fmri
-                fixed_path = moving_path.replace("aug_", "").replace("_bold.nii.gz", "_fixed.nii.gz")
-                mask_files = glob(os.path.join(data_folder, "mask_*.nii.gz"))
-                mask_path = mask_files[0]
-                out_folder = os.path.join(target_dir, "fmri_dataset", split_name, out_sub, "func")
-                extra_pattern = os.path.join(data_folder, f"{sub}_*_bold.nii.gz")
+            fixed_path = glob(os.path.join(data_folder, patterns["fixed"]))[0]
+            mask_path = glob(os.path.join(data_folder, patterns["mask"]))[0]
+            out_folder = os.path.join(target_dir, f"{mode}_dataset", split_name, out_sub, patterns["subdir"])
 
             os.makedirs(out_folder, exist_ok=True)
 
@@ -88,29 +97,29 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
             # ---------------------------
             # Extra file (only for testing)
             # ---------------------------
-            if split_name == "testing" and os.path.exists(extra_pattern):
-                shutil.copy2(extra_pattern, out_folder)
-                print(f"Copied extra file: {extra_pattern}")
+            extra_files = glob(os.path.join(data_folder, patterns["raw"]))
+            if split_name == "testing" and extra_files:
+                extra_file = extra_files[0]
+                shutil.copy2(extra_file, out_folder)
+                print(f"Copied extra file: {extra_file}")
 
-            # Save as .pt
             pt_filename = os.path.basename(moving_path).replace("aug_", "paired_").replace(".nii.gz", ".pt")
             pt_path = os.path.join(out_folder, pt_filename)
             torch.save({"moving": moving, "fixed": fixed, "mask": mask, "affine": affine}, pt_path)
 
-            # JSON entry
-            rel_to_dataset = os.path.relpath(pt_path, os.path.join(target_dir, dataset_root))
-            entry = {"data": rel_to_dataset}
-            entries.append(entry)
+            entries.append({"data": os.path.relpath(pt_path, target_dir)})
+
     entries = sorted(entries, key=lambda e: e["data"])
     return entries
 
+# -----------------------------
+# Collect subjects & save JSON file
+# -----------------------------
 def main(base_dir, mode):
     target_dir = os.path.join(base_dir, "prepared")
     os.makedirs(target_dir, exist_ok=True)
 
-    # -----------------------------
     # Collect subjects
-    # -----------------------------
     all_subjects = []
     for sub in os.listdir(base_dir):
         sub_path = os.path.join(base_dir, sub)
@@ -161,7 +170,7 @@ def main(base_dir, mode):
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python dataset_preparation.py <data_dir> <dwi|fmri>")
+        print("Usage: python dataset_preparation.py <data_dir> <dmri|fmri>")
         sys.exit(1)
 
     base_dir = sys.argv[1]
