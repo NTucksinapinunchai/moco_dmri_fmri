@@ -1,0 +1,17 @@
+# config filename patterns, make the script automatically find necessary files for the model.
+
+dmri:
+  raw: "sub-*dwi.nii.gz"
+  moving: "aug_*dwi.nii.gz"
+  fixed: "dup_*fixed.nii.gz"
+  mask: "mask_*.nii.gz"
+  subdir: "dwi"
+  suffix: "dwi"
+
+fmri:
+  raw: "sub-*bold.nii.gz"
+  moving: "aug_*bold.nii.gz"
+  fixed: "*_fixed.nii.gz"
+  mask: "mask_*.nii.gz"
+  subdir: "func"
+  suffix: "bold"
