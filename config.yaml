@@ -20,7 +20,7 @@ dmri:
 fmri:
   raw: "sub-*bold.nii.gz"
   moving: "aug_*bold.nii.gz"
-  fixed: "*_fixed.nii.gz"
+  fixed: "*_mean.nii.gz"
   mask: "mask_*.nii.gz"
   subdir: "func"
   suffix: "bold"
