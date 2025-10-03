@@ -77,39 +77,46 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
             out_sub = sub
 
         moving_files = glob(os.path.join(data_folder, patterns["moving"]))
+        if not moving_files:
+            continue
 
         for moving_path in moving_files:
             fixed_path = glob(os.path.join(data_folder, patterns["fixed"]))[0]
             mask_path = glob(os.path.join(data_folder, patterns["mask"]))[0]
             out_folder = os.path.join(target_dir, f"{mode}_dataset", split_name, out_sub, patterns["subdir"])
-
             os.makedirs(out_folder, exist_ok=True)
 
-            # Convert and save
-            moving, affine = load_as_tensor(moving_path, add_channel=True)
-            fixed, _ = load_as_tensor(fixed_path, add_channel=True)
-            mask, _ = load_as_tensor(mask_path, add_channel=True)
+            if split_name in ["training", "validation"]:
+                # --- Convert and save .pt ---
+                moving, affine = load_as_tensor(moving_path, add_channel=True)
+                fixed, _ = load_as_tensor(fixed_path, add_channel=True)
+                mask, _ = load_as_tensor(mask_path, add_channel=True)
 
-            for src in [moving_path, fixed_path, mask_path]:
-                if src and os.path.exists(src):
-                    shutil.copy2(src, out_folder)
+                pt_filename = os.path.basename(moving_path).replace("aug_", "paired_").replace(".nii.gz", ".pt")
+                pt_path = os.path.join(out_folder, pt_filename)
+                torch.save({"moving": moving, "fixed": fixed, "mask": mask, "affine": affine}, pt_path)
 
-            # ---------------------------
-            # Extra file (only for testing)
-            # ---------------------------
-            extra_files = glob(os.path.join(data_folder, patterns["raw"]))
-            if split_name == "testing" and extra_files:
-                extra_file = extra_files[0]
-                shutil.copy2(extra_file, out_folder)
-                print(f"Copied extra file: {extra_file}")
+                entries.append({"data": os.path.relpath(pt_path, target_dir)})
 
-            pt_filename = os.path.basename(moving_path).replace("aug_", "paired_").replace(".nii.gz", ".pt")
-            pt_path = os.path.join(out_folder, pt_filename)
-            torch.save({"moving": moving, "fixed": fixed, "mask": mask, "affine": affine}, pt_path)
+            elif split_name == "testing":
+                # --- Only copy NIfTIs, no .pt ---
+                for src in [moving_path, fixed_path, mask_path]:
+                    if src and os.path.exists(src):
+                        shutil.copy2(src, out_folder)
 
-            entries.append({"data": os.path.relpath(pt_path, target_dir)})
+                extra_files = glob(os.path.join(data_folder, patterns["raw"]))
+                if extra_files:
+                    shutil.copy2(extra_files[0], out_folder)
+                    print(f"Copied extra test file: {extra_files[0]}")
 
-    entries = sorted(entries, key=lambda e: e["data"])
+                # save relative path of NIfTIs into JSON (instead of .pt)
+                entries.append({
+                    "moving": os.path.relpath(moving_path, base_dir),
+                    "fixed": os.path.relpath(fixed_path, base_dir),
+                    "mask": os.path.relpath(mask_path, base_dir),
+                })
+
+    entries = sorted(entries, key=lambda e: list(e.values())[0])
     return entries
 
 # -----------------------------
