@@ -15,7 +15,6 @@ For fMRI data:
     - Compute mean across time to get mean fmri
     - Perform spinal cord segmentation
     - Create mask around the spinal cord
-    - Save mean fMRI as a 3D fixed reference
 
 Usage:
 ------
@@ -102,6 +101,36 @@ def process_subject(target, mode):
         mean_img = nii_files[0]
         print("Found mean dwi:", mean_img)
 
+        # ---------------------------
+        # Segmentation spinal cord
+        # ---------------------------
+        SCT_SEG = [
+            "sct_deepseg",
+            "spinalcord",
+            "-i", mean_img,
+        ]
+        subprocess.run(SCT_SEG, check=True)
+        print("Segmentation Success!")
+
+        # segmentation output
+        seg_files = glob.glob(os.path.join(os.path.dirname(mean_img), "*seg.nii.gz"))
+        if not seg_files:
+            print(f"No seg file produced for {target}")
+            return
+        seg_img = seg_files[0]
+
+        # ---------------------------
+        # Create MASK along the spinal cord
+        # ---------------------------
+        SCT_MASK = [
+            "sct_create_mask",
+            "-i", mean_img,
+            "-p", f"centerline,{seg_img}",
+            "-size", "35mm"
+        ]
+        subprocess.run(SCT_MASK, check=True, cwd=out_dir)
+        print("Mask Success!")
+
     elif mode == "fmri":
         out_dir = os.path.join(target, subdir)
         mean_img = os.path.join(out_dir, f"{prefix}_fmri_mean.nii.gz")
@@ -118,38 +147,39 @@ def process_subject(target, mode):
         subprocess.run(SCT_MATH, check=True, cwd=out_dir)
         print("Mean Success!")
 
-    else:
-        raise ValueError("Mode must be 'dmri' or 'fmri'")
+        seg_img = os.path.join(out_dir, f"{prefix}_seg.nii.gz")
+        # ---------------------------
+        # Segmentation spinal cord
+        # ---------------------------
+        SCT_SEG = [
+            "sct_deepseg",
+            "sc_epi",
+            "-i", mean_img,
+            "-o", seg_img
+        ]
+        subprocess.run(SCT_SEG, check=True)
+        print("Segmentation Success!")
 
-    # ---------------------------
-    # Segmentation spinal cord
-    # ---------------------------
-    SCT_SEG = [
-        "sct_deepseg",
-        "spinalcord",
-        "-i", mean_img,
-    ]
-    subprocess.run(SCT_SEG, check=True)
-    print("Segmentation Success!")
+        # segmentation output
+        seg_files = glob.glob(os.path.join(os.path.dirname(mean_img), "*seg.nii.gz"))
+        if not seg_files:
+            print(f"No seg file produced for {target}")
+            return
+        seg_img = seg_files[0]
 
-    # segmentation output
-    seg_files = glob.glob(os.path.join(os.path.dirname(mean_img), "*seg.nii.gz"))
-    if not seg_files:
-        print(f"No seg file produced for {target}")
-        return
-    seg_img = seg_files[0]
-
-    # ---------------------------
-    # Create MASK along the spinal cord
-    # ---------------------------
-    SCT_MASK = [
-        "sct_create_mask",
-        "-i", mean_img,
-        "-p", f"centerline,{seg_img}",
-        "-size", "35mm"
-    ]
-    subprocess.run(SCT_MASK, check=True, cwd=out_dir)
-    print("Mask Success!")
+        # ---------------------------
+        # Create MASK along the spinal cord
+        # ---------------------------
+        SCT_MASK = [
+            "sct_maths",
+            "-i", seg_img,
+            "-dilate", "15",
+            "-shape", "disk",
+            "-o", f"mask_{prefix}.nii.gz",
+            "-dim", "2"
+        ]
+        subprocess.run(SCT_MASK, check=True, cwd=out_dir)
+        print("Mask Success!")
 
     # ---------------------------
     # Create fixed volume reference --> 4D for dMRI, 3D for fMRI
@@ -184,16 +214,7 @@ def process_subject(target, mode):
         print("Saved corrected file:", out_corrected)
 
     elif mode == "fmri":
-        affine = nii.affine
-        header = nii.header
-        mean_fmri_data = nib.load(mean_img).get_fdata()
-
-        # ---------------------------
-        # Save only the mean fMRI as 3D fixed reference
-        # ---------------------------
-        out_fixed = os.path.join(target, subdir, f"{prefix}_fixed.nii.gz")
-        nib.save(nib.Nifti1Image(mean_fmri_data, affine, header), out_fixed)
-        print("Saved fixed file:", out_fixed)
+        pass # no duplication for fMRI
 
 # -----------------------------
 # CLI
