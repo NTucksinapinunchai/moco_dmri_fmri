@@ -18,11 +18,11 @@ Usage:
 ------
 In terminal/command line:
 
-    python test_model.py /path/to/data trained_weight
+    python test_model.py /path/to/data /path/to/trained_weight.ckpt
 
 Arguments:
-    /path/to/data   : directory of prepared dataset
-    trained_weight  : run name or checkpoint identifier (without .ckpt extension)
+    /path/to/data                   : directory of prepared dataset
+    /path/to/trained_weight.ckpt    : path directly to trained checkpoint file
 """
 
 import os
@@ -47,11 +47,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # -----------------------------
 # Main inference
 # -----------------------------
-def main(data_dir, run_name):
+def main(data_dir, ckpt_path):
     """
     Run inference on all subjects/sessions and save corrected volumes + flows.
     """
-    ckpt_path = os.path.join(os.path.dirname(data_dir), "trained_weights", f"{trained_weight}.ckpt")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     # -----------------------------
     # Load model
@@ -178,6 +179,6 @@ if __name__ == "__main__":
         print("Usage: python test_model.py <data_dir> <trained_weight>")
         sys.exit(1)
 
-    data_dir = sys.argv[1]
-    trained_weight = sys.argv[2]
-    main(data_dir, trained_weight)
+    data_dir = sys.argv[1]          # path to testing dataset
+    ckpt_path = sys.argv[2]         # full path to .ckpt file (trained-weight)
+    main(data_dir, ckpt_path)
