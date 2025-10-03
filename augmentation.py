@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Augmentation script to simulate motion artifacts in dMRI and fMRI data via slice-wise affine transforms (rotation + translation).
+Augmentation script to simulate motion artifacts in dMRI and fMRI data via slice-wise affine transformsใ
 
 - Automatically detects dMRI (*dwi.nii.gz) and fMRI (*bold.nii.gz) data following BIDS format.
-- Performs slice-wise transformations (x–y translation, in-plane rotation).
+- Performs slice-wise transformations (x–y translation).
 - Can handle both dMRI and fMRI; user specifies which mode.
 
 Usage:
@@ -33,8 +33,7 @@ class RandSliceWiseAffine:
     """
     Apply random slice-wise affine transform (rotation + shift) to a 3D volume.
     """
-    def __init__(self, max_rot=5, max_shift=2, prob=1.0, axis=2):
-        self.max_rot = max_rot
+    def __init__(self, max_shift=2, prob=1.0, axis=2):
         self.max_shift = max_shift
         self.prob = prob
         self.axis = axis
@@ -50,22 +49,20 @@ class RandSliceWiseAffine:
             H, W, D = out.shape
 
         for idx in range(D):
-            angle = np.random.uniform(-self.max_rot, self.max_rot)
             tx = np.random.uniform(-self.max_shift, self.max_shift)
             ty = np.random.uniform(-self.max_shift, self.max_shift)
 
-            theta = np.deg2rad(angle)
-            rot = np.array([[np.cos(theta), -np.sin(theta)],
-                            [np.sin(theta), np.cos(theta)]])
-            center = np.array([H / 2, W / 2])
-            inv_rot = np.linalg.inv(rot)
-            offset = center - inv_rot @ center + np.array([tx, ty])
+            # Identity transform (no rotation, only shift)
+            matrix = np.eye(2)
+            offset = np.array([tx, ty])
 
             out[:, :, idx] = affine_transform(
-                out[:, :, idx], inv_rot, offset=offset,
+                out[:, :, idx], matrix,
+                offset=offset,
                 order=0, mode="nearest"
             )
 
+            # move axis back
         if self.axis != 2:
             out = np.moveaxis(out, -1, self.axis)
 
@@ -102,7 +99,7 @@ def main(data_dir, mode):
     """
     Perform augmentation for all subjects in dataset directory (dmri or fmri).
     """
-    slicewise_tf = RandSliceWiseAffine(max_rot=5, max_shift=2, prob=1.0, axis=2)
+    slicewise_tf = RandSliceWiseAffine(max_shift=2, prob=1.0, axis=2)
     subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
 
     patterns = config[mode]
