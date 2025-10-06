@@ -65,6 +65,7 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
     """
     entries = []
     patterns = config[mode]
+    mode_dir = os.path.join(target_dir, f"{mode}_dataset")  # added for relative path calculation
 
     for sub_ses in subject_list:
         if "_ses-" in sub_ses:
@@ -83,7 +84,7 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
         for moving_path in moving_files:
             fixed_path = glob(os.path.join(data_folder, patterns["fixed"]))[0]
             mask_path = glob(os.path.join(data_folder, patterns["mask"]))[0]
-            out_folder = os.path.join(target_dir, f"{mode}_dataset", split_name, out_sub, patterns["subdir"])
+            out_folder = os.path.join(mode_dir, split_name, out_sub, patterns["subdir"])
             os.makedirs(out_folder, exist_ok=True)
 
             if split_name in ["training", "validation"]:
@@ -96,7 +97,8 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
                 pt_path = os.path.join(out_folder, pt_filename)
                 torch.save({"moving": moving, "fixed": fixed, "mask": mask, "affine": affine}, pt_path)
 
-                entries.append({"data": os.path.relpath(pt_path, target_dir)})
+                rel_path = os.path.relpath(pt_path, mode_dir)
+                entries.append({"data": rel_path})
 
             elif split_name == "testing":
                 # --- Only copy NIfTIs, no .pt ---
@@ -111,9 +113,9 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
 
                 # save relative path of NIfTIs into JSON (instead of .pt)
                 entries.append({
-                    "moving": os.path.relpath(moving_path, base_dir),
-                    "fixed": os.path.relpath(fixed_path, base_dir),
-                    "mask": os.path.relpath(mask_path, base_dir),
+                    "moving": os.path.join(split_name, out_sub, patterns["subdir"], os.path.basename(moving_path)),
+                    "fixed": os.path.join(split_name, out_sub, patterns["subdir"], os.path.basename(fixed_path)),
+                    "mask": os.path.join(split_name, out_sub, patterns["subdir"], os.path.basename(mask_path)),
                 })
 
     entries = sorted(entries, key=lambda e: list(e.values())[0])
