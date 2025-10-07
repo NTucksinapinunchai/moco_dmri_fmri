@@ -111,6 +111,15 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
                     shutil.copy2(extra_files[0], out_folder)
                     print(f"Copied extra test file: {extra_files[0]}")
 
+                # --- dMRI: also copy bval/bvec if they exist ---
+                if mode == "dmri":
+                    bval_files = glob(os.path.join(data_folder, "*.bval"))
+                    bvec_files = glob(os.path.join(data_folder, "*.bvec"))
+                    for extra in bval_files + bvec_files:
+                        if os.path.exists(extra):
+                            shutil.copy2(extra, out_folder)
+                            print(f"Copied dMRI gradient file: {extra}")
+
                 # save relative path of NIfTIs into JSON (instead of .pt)
                 entries.append({
                     "moving": os.path.join(split_name, out_sub, patterns["subdir"], os.path.basename(moving_path)),
