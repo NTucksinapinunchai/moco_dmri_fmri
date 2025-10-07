@@ -14,6 +14,7 @@ dmri:
   moving: "aug_*.nii.gz"
   fixed: "dup_*.nii.gz"
   mask: "mask_*.nii.gz"
+  moco: "moco_*.nii.gz"
   subdir: "dwi"
   suffix: "dwi"
 
@@ -22,5 +23,6 @@ fmri:
   moving: "aug_*bold.nii.gz"
   fixed: "*_mean.nii.gz"
   mask: "mask_*.nii.gz"
+  moco: "moco_*.nii.gz"
   subdir: "func"
   suffix: "bold"
