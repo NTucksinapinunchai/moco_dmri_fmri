@@ -3,15 +3,22 @@
 Created on Mon Sep 1 2025
 @author: Nontharat Tucksinapinunchai
 
-This script used to train a deep learning model for motion correction in dMRI or fMRI.
-It uses a VoxelMorphUNet to register 4D moving volumes to a fixed reference guided by a mask.
-The model combines L2 (MSE) and GNCC losses across time, with smoothness regularization and flow scaling.
+DenseRigidNet: DenseNet-based Rigid Motion Correction for dMRI/fMRI
+
+This script trains a deep learning model for motion correction in diffusion MRI (dMRI)
+or functional MRI (fMRI). It uses a DenseNet-based slice-wise regressor to estimate
+in-plane translations (Tx, Ty) for each slice and timepoint, guided by a mask and a
+fixed reference volume.
+
+The model is trained with a composite loss function combining:
+- Global normalized cross-correlation (GNCC)
+- L2 (MSE) and L1 losses inside a mask
+- Regularization on translation smoothness across slices and time
 
 Key features:
 - Handles both 4D moving + 4D fixed (dMRI) or 4D moving + 3D fixed (fMRI) with mask inputs
-- Mixed similarity loss (L2 + GNCC) computed across timepoints
-- Flow scaling and resampling to make input compatible with UNet architecture
 - Normalization inside mask using 1%–99% percentiles
+- Slice-wise translation estimation using DenseNet blocks
 - Saves best weights, logs training/validation losses, and integrates with W&B
 
 Usage:
@@ -22,7 +29,7 @@ In terminal/command line:
 
 Arguments:
     /path/to/base       : base directory containing the script and trained_weights
-    /path/to/data    : data directory depending on training dataset
+    /path/to/data       : data directory depending on training dataset
     run1                : identifier for this training run (checkpoint filename)
     run2 (opt)          : if provided, fine-tune or continue from run1 but save under run2 name
 
@@ -38,16 +45,16 @@ import time
 import torch
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.fastest = True
 
 import json
+import torch.nn as nn
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
 from torch import optim
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from monai.data import DataLoader, Dataset
-from monai.networks.nets import VoxelMorphUNet
-from monai.networks.blocks import Warp
 
 start_time = time.ctime()
 print("Start at:", start_time)
@@ -56,6 +63,9 @@ print("Start at:", start_time)
 # DataGenerator
 # -----------------------------
 class DataGenerator(Dataset):
+    """
+       Custom dataset class for loading paired dMRI/fMRI samples from .pt files.
+    """
     def __init__(self, file_list, data_dir):
         self.file_list = file_list
         self.data_dir = data_dir
@@ -68,14 +78,7 @@ class DataGenerator(Dataset):
         pt_path = sample["data"]
 
         # If absolute path in JSON
-        if os.path.isabs(pt_path):
-            final_path = pt_path
-        else:
-            final_path = os.path.join(self.data_dir, pt_path)
-
-        if not os.path.exists(final_path):
-            raise FileNotFoundError(f"Could not find file: {final_path}")
-
+        final_path = pt_path if os.path.isabs(pt_path) else os.path.join(self.data_dir, pt_path)
         data = torch.load(final_path, weights_only=False)
 
         moving = data["moving"]  # (B,1,H,W,D,T)
@@ -90,6 +93,10 @@ class DataGenerator(Dataset):
 # DataModule
 # -----------------------------
 class DataModule(pl.LightningDataModule):
+    """
+        PyTorch Lightning DataModule for motion correction training.
+        Handles training/validation split from dataset.json and provides DataLoaders for both.
+    """
     def __init__(self, json_path, data_dir, batch_size, num_workers):
         super().__init__()
         self.json_path = json_path
@@ -104,247 +111,336 @@ class DataModule(pl.LightningDataModule):
 
         self.train_ds = DataGenerator(dataset_dict["training"], self.data_dir)
         self.val_ds = DataGenerator(dataset_dict["validation"], self.data_dir)
-        self.test_ds = DataGenerator(dataset_dict["testing"], self.data_dir)
 
     def train_dataloader(self):
         return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True,
-                          num_workers=self.num_workers, pin_memory=True, persistent_workers=True)
+                          num_workers=self.num_workers, pin_memory=True, persistent_workers=True, prefetch_factor=4)
 
     def val_dataloader(self):
         return DataLoader(self.val_ds, batch_size=self.batch_size, shuffle=False,
-                          num_workers=self.num_workers, pin_memory=True, persistent_workers=True)
+                          num_workers=self.num_workers, pin_memory=True, persistent_workers=True, prefetch_factor=4)
 
 # -----------------------------
 # Some helper function
 # -----------------------------
-def resample_to_multiple(x, multiple=32, mode="trilinear"):
-    """
-    Resample tensor to nearest multiple of given size using interpolation.
-    """
-    B, C, H, W, D = x.shape
-    new_H = ((H + multiple - 1) // multiple) * multiple
-    new_W = ((W + multiple - 1) // multiple) * multiple
-    new_D = ((D + multiple - 1) // multiple) * multiple
-    new_size = (new_H, new_W, new_D)
-
-    # Align corners only if interpolation mode supports it
-    if mode in ["linear", "bilinear", "bicubic", "trilinear"]:
-        x_resampled = F.interpolate(x, size=new_size, mode=mode, align_corners=False)
-    else:
-        x_resampled = F.interpolate(x, size=new_size, mode=mode)
-    return x_resampled, (H, W, D)
-
-def resample_back(x, orig_size, mode="trilinear"):
-    """
-    Resample tensor back to original size after UNet processing.
-    """
-    H, W, D = orig_size
-    if mode in ["trilinear", "bilinear", "linear"]:
-        return F.interpolate(x, size=(H, W, D), mode=mode, align_corners=False)
-    else:
-        return F.interpolate(x, size=(H, W, D), mode=mode)
-
-def normalize_meanstd(x, mask, eps=1e-6):
-    """
-    Normalize within mask using mean/std instead of quantiles for stability.
-    """
-    m = mask > 0
-    mean = (x[m]).mean() if m.any() else 0
-    std = (x[m]).std() + eps
-    x = (x - mean) / std
-    return x * mask
-
 def _get_fixed_t(fixed: torch.Tensor, t: int) -> torch.Tensor:
     """
-    Return fixed volume (B,1,H,W,D) at time t,
-    supporting both 3D fixed (fMRI) and 4D fixed (dMRI).
+    Return fixed volume (B,1,H,W,D) at time t, supporting both 3D fixed (fMRI) and 4D fixed (dMRI).
     """
-    if fixed.ndim == 5:  # (B,1,H,W,D)
-        return fixed.contiguous()  # same ref for all timepoints, no gradient
+    if fixed.ndim == 5:
+        return fixed.contiguous()
     if fixed.ndim == 6:
         if isinstance(t, torch.Tensor):
             t = int(t.item())
         return fixed[..., t].contiguous()
-    else:
-        raise ValueError(f"Unexpected fixed ndim={fixed.ndim}")
+    raise ValueError(f"Unexpected fixed ndim={fixed.ndim}")
 
 # -----------------------------
-# Loss function
+# Loss function (Similarity losses (LNCC + L2) and Rigid Smoothness)
 # -----------------------------
-# L2 loss (MSE)
-def l2_loss(a, b, mask):
+def erode_mask(m, k=3):
     """
-    Compute Mean squared error loss inside the mask
+    Applies 3D binary erosion on a mask.
+    """
+    ker = torch.ones(1, 1, k, k, k, device=m.device, dtype=m.dtype)
+    pad = k // 2
+    return (F.conv3d(m.float(), ker, padding=pad) == k**3).float()
+
+def normalize_volume(x, mask, pmin=1, pmax=99, eps=1e-6):
+    """
+    Normalizes intensity inside mask to 0–1 range using percentile scaling.
     """
     m = (mask > 0).float()
-    diff = (a - b) * m
-    l2 = (diff.pow(2).sum() / (m.sum() + 1e-6))
-    return l2
+    vals = x[m.bool()]
+    if vals.numel() < 10:
+        return x  # skip if mask empty
+    lo = torch.quantile(vals, pmin/100)
+    hi = torch.quantile(vals, pmax/100)
+    return ((x - lo) / (hi - lo + eps)).clamp(0, 1) * m
 
-# Global Normalized Cross-Correlation (GNCC)
-def gncc_loss(a, b, mask, eps=1e-6):
+def global_ncc_loss(a, b, mask, eps=1e-6):
     """
-    Compute Global NCC loss inside mask
+    Compute global normalized cross-correlation (GNCC) across timepoints inside mask.
     """
-    m = (mask > 0).float()
-    a = normalize_meanstd(a, m)
-    b = normalize_meanstd(b, m)
-    num = ((a * b) * m).sum()
-    den = torch.sqrt(((a ** 2) * m).sum() * ((b ** 2) * m).sum() + eps)
-    return -(num / den)
+    B, C, H, W, D, T_w = a.shape
+    T_f = b.shape[-1] if b.ndim == 6 else 1
+    T = min(T_w, T_f)
 
-# Similarlity loss (L2+GNCC)
-def similarity_loss(warped_all, fixed, mask):
-    """
-    Average masked L2+GNCC loss across timepoints
-        a, b:   (B,1,H,W,D,T)
-        mask:   (B,1,H,W,D)
-    """
-    B, _, _, _, _, T = warped_all.shape
-    total = 0
+    mask = erode_mask(mask, k=3)
+    vals = []
     for t in range(T):
-        w_t, f_t = warped_all[..., t], _get_fixed_t(fixed, t)
-        w_t, f_t = normalize_meanstd(w_t, mask), normalize_meanstd(f_t, mask)
-        total += 0.5 * l2_loss(w_t, f_t, mask) + 1.0 * gncc_loss(w_t, f_t, mask)
-    return total / T
+        a_t = normalize_volume(a[..., t], mask) * mask
+        b_t = normalize_volume(_get_fixed_t(b, t), mask) * mask
+        a_mean = a_t.mean(dim=(2,3,4), keepdim=True)
+        b_mean = b_t.mean(dim=(2,3,4), keepdim=True)
+        a0, b0 = a_t - a_mean, b_t - b_mean
+        num = (a0 * b0).mean(dim=(2,3,4), keepdim=True)
+        den = torch.sqrt(
+            (a0.pow(2).mean(dim=(2,3,4), keepdim=True) *
+             b0.pow(2).mean(dim=(2,3,4), keepdim=True))
+        ).clamp_min(eps)
+        vals.append(-(num / den).mean())
+    return torch.stack(vals).mean()
+
+def l2_loss(warped_all, fixed, mask):
+    """
+    Compute mean-squared error (L2 loss) across timepoints inside mask.
+    """
+    B, C, H, W, D, T_w = warped_all.shape
+    T_f = fixed.shape[-1] if fixed.ndim == 6 else 1
+    T = min(T_w, T_f)
+
+    mask = erode_mask(mask, k=3)
+    losses = []
+    for t in range(T):
+        warped_t = normalize_volume(warped_all[..., t], mask)
+        fixed_t  = normalize_volume(_get_fixed_t(fixed, t), mask)
+        losses.append(F.mse_loss(warped_t * mask, fixed_t * mask))
+    return torch.stack(losses).mean()
+
+def l1_loss(warped_all, fixed, mask):
+    """
+    Compute mean absolute error (L1 loss) across timepoints inside mask.
+    """
+    B, C, H, W, D, T_w = warped_all.shape
+    T_f = fixed.shape[-1] if fixed.ndim == 6 else 1
+    T = min(T_w, T_f)
+
+    mask = erode_mask(mask, k=3)
+    losses = []
+    for t in range(T):
+        warped_t = normalize_volume(warped_all[..., t], mask)
+        fixed_t  = normalize_volume(_get_fixed_t(fixed, t), mask)
+        losses.append(F.l1_loss(warped_t * mask, fixed_t * mask))
+    return torch.stack(losses).mean()
+
+def rigid_smoothness(Tx, Ty, lam_mag=1e-5, lam_z=1e-5, lam_t=1e-5):
+    """
+    Smoothness regularization along slice (z) and time (t).
+    """
+    def dz(t): return (t[..., 1:, :] - t[..., :-1, :]).abs().mean()
+    def dt(t): return (t[..., :, 1:] - t[..., :, :-1]).abs().mean()
+    mag = (Tx.pow(2).mean() + Ty.pow(2).mean())
+    return lam_mag * mag + lam_z * (dz(Tx) + dz(Ty)) + lam_t * (dt(Tx) + dt(Ty))
 
 # -----------------------------
-# LightningModule
+# DenseNet (Block and Layer) + Differentiable Warp
 # -----------------------------
-class VoxelMorphReg(pl.LightningModule):
-    def __init__(self, lr=1e-4, lambda_smooth=0.01, flow_scale=3.0):
+class DenseBlock(nn.Module):
+    """
+    3D DenseNet block with growth connections.
+    """
+    def __init__(self, in_channels, growth_rate, n_layers=5):
+        super().__init__()
+        layers, channels = [], in_channels
+        for _ in range(n_layers):
+            layers.append(nn.Sequential(
+                nn.InstanceNorm3d(channels, affine=True, track_running_stats=False),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(channels, growth_rate, 3, padding=1, bias=False)
+            ))
+            channels += growth_rate
+        self.block = nn.ModuleList(layers)
+
+    def forward(self, x):
+        for l in self.block:
+            out = l(x)
+            x = torch.cat([x, out], dim=1)
+        return x
+
+class DenseNetRegressorSliceWise(nn.Module):
+    """
+    DenseNet backbone that predicts slice-wise in-plane translation (Tx, Ty) for each z-slice in the 3D volume.
+    Output shape: (B, 3, D)
+    """
+    def __init__(self, in_channels=2, growth_rate=8, num_blocks=2, max_vox_shift=5.0):
+        super().__init__()
+        self.conv_in = nn.Conv3d(in_channels, 16, (3, 3, 1), stride=(2, 2, 1), padding=(1, 1, 0))
+        self.blocks = nn.ModuleList()
+        self.max_vox_shift = max_vox_shift
+        self.shift_scale = nn.Parameter(torch.tensor(1.0))  # learnable >0 via softplus
+
+        ch = 16
+        for _ in range(num_blocks):
+            blk = DenseBlock(ch, growth_rate)
+            self.blocks.append(blk)
+            ch += growth_rate * 5
+            self.blocks.append(nn.Sequential(
+                nn.InstanceNorm3d(ch, affine=True, track_running_stats=False),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(ch, ch // 2, 1, bias=False),
+                nn.MaxPool3d((2, 2, 1))     # sharper feature propagation
+            ))
+            ch = ch // 2
+
+        # keep slice (depth) dimension, pool only H,W
+        self.slice_pool = nn.AdaptiveAvgPool3d((1, 1, None))
+        self.conv_out = nn.Conv1d(ch, 2, kernel_size=1)  # output Tx, Ty, Th per slice
+
+        # initialize output near zero (identity)
+        nn.init.zeros_(self.conv_out.weight)
+        nn.init.zeros_(self.conv_out.bias)
+
+    def forward(self, x):
+        x = self.conv_in(x)
+        for b in self.blocks:
+            x = b(x)
+        x = x.mean(dim=(2,3))           # (B, C, D')
+        theta = self.conv_out(x)        # (B, 2, D')
+
+        s = torch.nn.functional.softplus(self.shift_scale) + 1e-4
+        Ty = torch.tanh(theta[:, 0:1, :]) * (self.max_vox_shift * s)
+        Tx = torch.tanh(theta[:, 1:2, :]) * (self.max_vox_shift * s)
+        return torch.cat([Tx, Ty], dim=1)
+
+class DifferentiableRigidWarp(nn.Module):
+    """
+    Apply rigid 2D transformation (Tx, Ty) slice-wise. Each slice is translated independently in-plane.
+    """
+    def forward(self, vol, Tx, Ty):
+        assert vol.ndim == 5, "vol must be (B,C,H,W,D)"
+        B, C, H, W, D = vol.shape
+        device = vol.device
+        dtype = vol.dtype
+
+        # (B,1,D) -> (B,D)
+        Tx = Tx.view(B, D)
+        Ty = Ty.view(B, D)
+
+        # Build base 2D grid in [-1,1], shape (H,W,2)
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device, dtype=dtype),
+            torch.linspace(-1, 1, W, device=device, dtype=dtype),
+            indexing="ij"
+        )
+        base = torch.stack([xx, yy], dim=-1)  # (H,W,2)
+
+        # Expand to (B,D,H,W,2)
+        base = base.view(1, 1, H, W, 2).expand(B, D, H, W, 2)
+
+        # Normalize translations to grid units [-1,1]
+        txn = (2.0 * Tx / max(W - 1, 1)).view(B, D, 1, 1, 1)  # (B,D,1,1,1)
+        tyn = (2.0 * Ty / max(H - 1, 1)).view(B, D, 1, 1, 1)
+
+        grid = base.clone()
+        grid[..., 0] += txn[..., 0]  # x += Tx
+        grid[..., 1] += tyn[..., 0]  # y += Ty
+
+        # Reshape for 2D grid_sample
+        grid_2d = grid.view(B * D, H, W, 2)  # (B*D,H,W,2)
+        vol_2d = vol.permute(0, 4, 1, 2, 3).reshape(B * D, C, H, W)  # (B*D,C,H,W)
+
+        warped_2d = F.grid_sample(
+            vol_2d, grid_2d,
+            mode="bilinear", padding_mode="border", align_corners=False
+        )
+        warped = warped_2d.view(B, D, C, H, W).permute(0, 2, 3, 4, 1).contiguous()  # (B,C,H,W,D)
+        return warped
+
+class DenseRigidDSRReg(pl.LightningModule):
+    """
+    Main PyTorch Lightning module for DenseNet-based rigid motion correction.
+    """
+    def __init__(self, lr=1e-4):
         super().__init__()
         self.lr = lr
-        self.lambda_smooth = lambda_smooth
-        self.flow_scale = flow_scale
-
-        # UNet now outputs 2 channels = Tx, Ty
-        self.unet = VoxelMorphUNet(
-            spatial_dims=3,
-            in_channels=2,
-            unet_out_channels=2,
-            channels=(16, 32, 32, 32,),
-            final_conv_channels=(16,),
-            kernel_size=3,
-        )
-        self.transformer = Warp(mode="bilinear", padding_mode="border")
+        self.backbone = DenseNetRegressorSliceWise(in_channels=2, max_vox_shift=3.0)
+        self.warp = DifferentiableRigidWarp()
 
     def forward(self, moving, fixed, mask):
         """
-        moving: (B, 1, H, W, D, T)
-        fixed:  (B, 1, H, W, D) or (B, 1, H, W, D, T) --> the model will handle both 3D and 4D
-                - dMRI: (B,1,H,W,D,T) -> mean b0 and mean dwi over timepoints
-                - fMRI: (B,1,H,W,D)   -> static mean fMRI
-        mask:  (B, 1, H, W, D)
-        returns:
-          warped: (B, 1, H, W, D, T)
-          Tx_all, Ty_all, Tz_all : (B, 1, D, T)
-        """
-        B, C, H, W, D, T = moving.shape
-        warped_list, Tx_list, Ty_list, Tz_list = [], [], [], []
-
-        # Precompute mask once
-        mask_res, _ = resample_to_multiple(mask, multiple=32, mode="nearest")
+            moving: (B,1,H,W,D,T)
+            fixed:  (B,1,H,W,D) or (B,1,H,W,D,T)
+            mask:   (B,1,H,W,D)
+            Returns:
+                warped_all: (B,1,H,W,D,T)
+                Tx_all, Ty_all: (B,1,D,T)
+            """
+        B, _, H, W, D, T = moving.shape
+        warped_list, Tx_list, Ty_list = [], [], []
 
         for t in range(T):
-            mov_t = moving[..., t]  # (B,1,H,W,D)
-            fix_t = _get_fixed_t(fixed, t)  # fMRI → static or dMRI → time-varying
-
-            # Resample to UNet-compatible shape
-            mov_t_res, orig_size = resample_to_multiple(mov_t, multiple=32, mode="trilinear")
-            fix_t_res, _ = resample_to_multiple(fix_t, multiple=32, mode="trilinear")
-
-            # Downsample before UNet (OOM control)
-            mov_ds = F.interpolate(mov_t_res, scale_factor=0.5, mode="trilinear", align_corners=False)
-            fix_ds = F.interpolate(fix_t_res, scale_factor=0.5, mode="trilinear", align_corners=False)
-            mask_ds = F.interpolate(mask_res, scale_factor=0.5, mode="nearest")
+            mov_t = moving[..., t]
+            fix_t = _get_fixed_t(fixed, t)
 
             # Normalize at the same resolution as the network input
-            mov_t_norm_ds = normalize_meanstd(mov_ds, mask_ds)
-            fix_t_norm_ds = normalize_meanstd(fix_ds, mask_ds)
+            mov_norm_ds = normalize_volume(mov_t, mask)
+            fix_norm_ds = normalize_volume(fix_t, mask)
 
-            # UNet input
-            x = torch.cat([mov_t_norm_ds, fix_t_norm_ds], dim=1)
+            x = torch.cat([mov_norm_ds, fix_norm_ds], dim=1)
 
-            # Predict Tx, Ty
-            flow_ds = torch.tanh(self.unet(x)) * self.flow_scale  # UNet
+            theta = self.backbone(x)  # (B, 2, D')
+            Ty = theta[:, 0:1, :]
+            Tx = theta[:, 1:2, :]
 
-            # Upsample Tx/Ty back to original resolution
-            flow = F.interpolate(flow_ds, size=mov_t_res.shape[2:], mode="trilinear", align_corners=False)
-
-            # Mean over H,W → per-slice translation
-            flow_mean = flow.mean(dim=(2, 3))  # (B, 2, D)
-            Tx = flow_mean[:, 0, :]
-            Ty = flow_mean[:, 1, :]
-
-            orig_D = mov_t.shape[-1]
-            if Tx.shape[-1] != orig_D:
-                Tx = F.interpolate(Tx.unsqueeze(1), size=orig_D, mode="linear", align_corners=False).squeeze(1)
-                Ty = F.interpolate(Ty.unsqueeze(1), size=orig_D, mode="linear", align_corners=False).squeeze(1)
-
-            # Build rigid-like 3D field (Z displacement = 0)
-            B_, _, H, W, D = mov_t.shape
-            flow_field = torch.zeros((B_, 3, H, W, D), device=mov_t.device, dtype=mov_t.dtype)
-            flow_field[:, 0] = Tx[:, None, None, :].expand(B_, H, W, D)
-            flow_field[:, 1] = Ty[:, None, None, :].expand(B_, H, W, D)
-            # flow_field[:, 2] = 0 (no Z motion)
-
-            warped = self.transformer(mov_t, flow_field)
+            warped = self.warp(mov_t, Tx, Ty)
             warped_list.append(warped)
-
             Tx_list.append(Tx)
             Ty_list.append(Ty)
 
-            del mov_t, fix_t, mov_t_res, fix_t_res, mov_ds, fix_ds, mask_ds, flow_ds, flow, flow_field
+            # cleanup
+            del mov_t, fix_t, mov_norm_ds, fix_norm_ds, x, theta
+            torch.cuda.empty_cache()
 
         warped_all = torch.stack(warped_list, dim=-1)
-        Tx_all = torch.stack(Tx_list, dim=-1).unsqueeze(1)
-        Ty_all = torch.stack(Ty_list, dim=-1).unsqueeze(1)
-
+        Tx_all = torch.stack(Tx_list, dim=-1)  # (B,1,D,T)
+        Ty_all = torch.stack(Ty_list, dim=-1)
         return warped_all, Tx_all, Ty_all
 
     def training_step(self, batch, batch_idx):
         moving, fixed, mask = batch["moving"], batch["fixed"], batch["mask"]
-        warped, Tx, Ty = self(moving, fixed, mask)
+        warped_all, Tx, Ty = self(moving, fixed, mask)
 
-        loss_sim = similarity_loss(warped, fixed, mask)
+        # Similarity (GNCC + masked L2 + masked L1)
+        loss_lncc = global_ncc_loss(warped_all, fixed, mask)  # negative → lower is better
+        loss_l2 = l2_loss(warped_all, fixed, mask)
+        loss_l1 = l1_loss(warped_all, fixed, mask)
 
-        # Smoothness only across Z and T for Tx, Ty
-        dTx_z = Tx.diff(dim=2).pow(2).mean()
-        dTy_z = Ty.diff(dim=2).pow(2).mean()
-        dTx_t = Tx.diff(dim=3).pow(2).mean()
-        dTy_t = Ty.diff(dim=3).pow(2).mean()
-        loss_smooth = (dTx_z + dTy_z + dTx_t + dTy_t) / 4.0
+        # Weighted combination
+        loss_sim = 0.2 * loss_l2 + 1.0 * loss_lncc + 0.3 * loss_l1
 
-        loss = loss_sim + self.lambda_smooth * loss_smooth
+        # Rigid smoothness regularizer
+        loss_reg = rigid_smoothness(Tx, Ty)
 
+        # Final composite loss
+        loss = loss_sim + loss_reg
+
+        # Logging
         B = moving.size(0)
         self.log("train_loss", loss, prog_bar=True, batch_size=B)
-        self.log("train_sim_loss", loss_sim, batch_size=B)
-        self.log("train_smooth_loss", loss_smooth, batch_size=B)
+        self.log("train_lncc_loss", loss_lncc, batch_size=B)
+        self.log("train_l2_loss", loss_l2, batch_size=B)
+        self.log("train_l1_loss", loss_l1, batch_size=B)
+        self.log("train_rigid_reg", loss_reg, batch_size=B)
+        torch.cuda.empty_cache()
         return loss
 
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
             moving, fixed, mask = batch["moving"], batch["fixed"], batch["mask"]
-            warped, Tx, Ty = self(moving, fixed, mask)
+            warped_all, Tx, Ty = self(moving, fixed, mask)
 
-            loss_sim = similarity_loss(warped, fixed, mask)
-            dTx_z = Tx.diff(dim=2).pow(2).mean()
-            dTy_z = Ty.diff(dim=2).pow(2).mean()
-            dTx_t = Tx.diff(dim=3).pow(2).mean()
-            dTy_t = Ty.diff(dim=3).pow(2).mean()
-            loss_smooth = (dTx_z + dTy_z + dTx_t + dTy_t) / 4.0
+            loss_lncc = global_ncc_loss(warped_all, fixed, mask)  # negative → lower is better
+            loss_l2 = l2_loss(warped_all, fixed, mask)
+            loss_l1 = l1_loss(warped_all, fixed, mask)
 
-            loss = loss_sim + self.lambda_smooth * loss_smooth
+            loss_sim = 0.2 * loss_l2 + 1.0 * loss_lncc + 0.3 * loss_l1
+
+            loss_reg = rigid_smoothness(Tx, Ty)
+
+            loss = loss_sim + loss_reg
+
             B = moving.size(0)
             self.log("val_loss", loss, prog_bar=True, batch_size=B)
-            self.log("val_sim_loss", loss_sim, batch_size=B)
-            self.log("val_smooth_loss", loss_smooth, batch_size=B)
+            self.log("val_lncc_loss", loss_lncc, batch_size=B)
+            self.log("val_l2_loss", loss_l2, batch_size=B)
+            self.log("val_l1_loss", loss_l1, batch_size=B)
+            self.log("val_rigid_reg", loss_reg, batch_size=B)
+            torch.cuda.empty_cache()
             return loss
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = optim.Adam(self.parameters(), lr=self.lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=15, verbose=True
         )
@@ -380,11 +476,9 @@ if __name__ == "__main__":
     # -----------------------------
     # Training setup
     # -----------------------------
-    num_epochs = 50
+    num_epochs = 100
     batch_size = 1
-    lr = 1e-4
-    lambda_smooth = 0.01
-    flow_scale = 3.0
+    lr = 1e-5
     num_workers = 8
 
     # -----------------------------
@@ -415,11 +509,10 @@ if __name__ == "__main__":
     # Load only model weights (use checkpoint as initialization for a new run)
     if pretrained_ckpt is not None and os.path.exists(pretrained_ckpt):
         print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
-        model = VoxelMorphReg.load_from_checkpoint(pretrained_ckpt, lr=lr, lambda_smooth=lambda_smooth,
-                                                   flow_scale=flow_scale)
+        model = DenseRigidDSRReg.load_from_checkpoint(pretrained_ckpt, lr=lr)
     else:
         print("No pretrained checkpoint found, training from scratch.")
-        model = VoxelMorphReg(lr=lr, lambda_smooth=lambda_smooth, flow_scale=flow_scale)
+        model = DenseRigidDSRReg(lr=lr)
 
     # -----------------------------
     # trainer
@@ -429,14 +522,15 @@ if __name__ == "__main__":
 
     wandb.login(key="ab48d9c3a5dee9883bcb676015f2487c1bc51f74")
     wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}")
+
     # If continue with the pretrained_ckpt, resume logs to the same wandb run
-    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}", id="9on2ss9i", resume="must")
+    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}", id="pszc74k6", resume="must")
+
     wandb_config = wandb_logger.experiment.config
     wandb_config.update({
         "num_epochs": num_epochs,
         "batch_size": batch_size,
         "lr": lr,
-        "lambda_smooth": lambda_smooth,
         "data_path": data_path
     }, allow_val_change=True)
 
@@ -450,7 +544,8 @@ if __name__ == "__main__":
         accelerator="gpu",
         devices=1,
         precision="16-mixed",
-        log_every_n_steps=10,
+        gradient_clip_val=1.0,
+        log_every_n_steps=25,
         deterministic=False,
         enable_progress_bar=True,
         enable_model_summary=True,
