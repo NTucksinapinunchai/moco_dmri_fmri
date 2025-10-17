@@ -10,19 +10,19 @@
 #   suffix : suffix used in output filenames
 
 dmri:
-  raw: "sub-*dwi.nii.gz"
-  moving: "aug_*.nii.gz"
-  fixed: "dup_*.nii.gz"
+  raw: "sub-*_dwi.nii.gz"
+  moving: "aug_*_dwi.nii.gz"
+  fixed: "dup_*_dwi.nii.gz"
   mask: "mask_*.nii.gz"
-  moco: "moco_*.nii.gz"
+  moco: "moco_*_dwi.nii.gz"
   subdir: "dwi"
   suffix: "dwi"
 
 fmri:
-  raw: "sub-*bold.nii.gz"
-  moving: "aug_*bold.nii.gz"
+  raw: "sub-*_bold.nii.gz"
+  moving: "aug_*_bold.nii.gz"
   fixed: "*_mean.nii.gz"
   mask: "mask_*.nii.gz"
-  moco: "moco_*.nii.gz"
+  moco: "moco_*_bold.nii.gz"
   subdir: "func"
   suffix: "bold"
