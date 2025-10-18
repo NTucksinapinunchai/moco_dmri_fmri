@@ -224,17 +224,17 @@ def rigid_smoothness(Tx, Ty, lam_mag=1e-5, lam_z=1e-5, lam_t=1e-5):
     return lam_mag * mag + lam_z * (dz(Tx) + dz(Ty)) + lam_t * (dt(Tx) + dt(Ty))
 
 # -----------------------------
-# DenseNet (Block and Layer) + Differentiable Warp
+# Dense Block and Layer
 # -----------------------------
 class DenseBlock(nn.Module):
     """
-    3D DenseNet block with growth connections.
+    3D DenseNet block (multiple Dense Layers) with growth connections.
     """
     def __init__(self, in_channels, growth_rate, n_layers=5):
         super().__init__()
         layers, channels = [], in_channels
         for _ in range(n_layers):
-            layers.append(nn.Sequential(
+            layers.append(nn.Sequential(        # Dense Layer: IN → ReLU → Conv(3x3)
                 nn.InstanceNorm3d(channels, affine=True, track_running_stats=False),
                 nn.ReLU(inplace=True),
                 nn.Conv3d(channels, growth_rate, 3, padding=1, bias=False)
@@ -248,6 +248,9 @@ class DenseBlock(nn.Module):
             x = torch.cat([x, out], dim=1)
         return x
 
+# -----------------------------
+# DenseNet
+# -----------------------------
 class DenseNetRegressorSliceWise(nn.Module):
     """
     DenseNet backbone that predicts slice-wise in-plane translation (Tx, Ty) for each z-slice in the 3D volume.
@@ -262,10 +265,10 @@ class DenseNetRegressorSliceWise(nn.Module):
 
         ch = 16
         for _ in range(num_blocks):
-            blk = DenseBlock(ch, growth_rate)
+            blk = DenseBlock(ch, growth_rate)   # DenseBlock
             self.blocks.append(blk)
             ch += growth_rate * 5
-            self.blocks.append(nn.Sequential(
+            self.blocks.append(nn.Sequential(       # Transition Layer: IN → ReLU → Conv(1x1) → MaxPool(2x2)
                 nn.InstanceNorm3d(ch, affine=True, track_running_stats=False),
                 nn.ReLU(inplace=True),
                 nn.Conv3d(ch, ch // 2, 1, bias=False),
@@ -293,7 +296,10 @@ class DenseNetRegressorSliceWise(nn.Module):
         Tx = torch.tanh(theta[:, 1:2, :]) * (self.max_vox_shift * s)
         return torch.cat([Tx, Ty], dim=1)
 
-class DifferentiableRigidWarp(nn.Module):
+# -----------------------------
+# Warp Function
+# -----------------------------
+class RigidWarp(nn.Module):
     """
     Apply rigid 2D transformation (Tx, Ty) slice-wise. Each slice is translated independently in-plane.
     """
@@ -307,7 +313,7 @@ class DifferentiableRigidWarp(nn.Module):
         Tx = Tx.view(B, D)
         Ty = Ty.view(B, D)
 
-        # Build base 2D grid in [-1,1], shape (H,W,2)
+        # Build base 2D grid (sampling grid) in [-1,1], shape (H,W,2)
         yy, xx = torch.meshgrid(
             torch.linspace(-1, 1, H, device=device, dtype=dtype),
             torch.linspace(-1, 1, W, device=device, dtype=dtype),
@@ -330,6 +336,7 @@ class DifferentiableRigidWarp(nn.Module):
         grid_2d = grid.view(B * D, H, W, 2)  # (B*D,H,W,2)
         vol_2d = vol.permute(0, 4, 1, 2, 3).reshape(B * D, C, H, W)  # (B*D,C,H,W)
 
+        # Warping
         warped_2d = F.grid_sample(
             vol_2d, grid_2d,
             mode="bilinear", padding_mode="border", align_corners=False
@@ -337,7 +344,10 @@ class DifferentiableRigidWarp(nn.Module):
         warped = warped_2d.view(B, D, C, H, W).permute(0, 2, 3, 4, 1).contiguous()  # (B,C,H,W,D)
         return warped
 
-class DenseRigidDSRReg(pl.LightningModule):
+# -----------------------------
+# Main Model
+# -----------------------------
+class DenseRigidReg(pl.LightningModule):
     """
     Main PyTorch Lightning module for DenseNet-based rigid motion correction.
     """
@@ -345,7 +355,7 @@ class DenseRigidDSRReg(pl.LightningModule):
         super().__init__()
         self.lr = lr
         self.backbone = DenseNetRegressorSliceWise(in_channels=2, max_vox_shift=3.0)
-        self.warp = DifferentiableRigidWarp()
+        self.warp = RigidWarp()
 
     def forward(self, moving, fixed, mask):
         """
@@ -509,10 +519,10 @@ if __name__ == "__main__":
     # Load only model weights (use checkpoint as initialization for a new run)
     if pretrained_ckpt is not None and os.path.exists(pretrained_ckpt):
         print(f"Starting NEW training, initialized from: {pretrained_ckpt}")
-        model = DenseRigidDSRReg.load_from_checkpoint(pretrained_ckpt, lr=lr)
+        model = DenseRigidReg.load_from_checkpoint(pretrained_ckpt, lr=lr)
     else:
         print("No pretrained checkpoint found, training from scratch.")
-        model = DenseRigidDSRReg(lr=lr)
+        model = DenseRigidReg(lr=lr)
 
     # -----------------------------
     # trainer
