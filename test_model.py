@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Inference script used to generate the motion-corrected 4D volumes from VoxelMorphReg model.
+Inference script used to generate the motion-corrected 4D volumes from DenseRigidDSRReg model.
 
-This script loads raw NIfTI files (moving, fixed, mask) directly and applies the
-trained VoxelMorphReg checkpoint to perform motion correction. It outputs the corrected
-4D volume as well as the translation maps (Tx, Ty)
+This script loads raw NIfTI files (moving, fixed, mask) directly and applies the trained
+DenseRigidDSRReg checkpoint to perform motion correction. It outputs the corrected
+4D volume as well as the translation parameters (Tx, Ty)
 
 Features:
 ---------
@@ -13,6 +13,12 @@ Features:
 - Performs inference with the trained checkpoint.
 - Saves motion-corrected volumes and displacement fields as NIfTI files.
 - Reports inference timing statistics across subjects.
+
+Outputs:
+---------
+- Motion-corrected 4D NIfTI (moco_*)
+- 2 rigid translation parameter: Tx, Ty  (each [D,T])
+- Timing statistics
 
 Usage:
 ------
@@ -36,8 +42,7 @@ import numpy as np
 import nibabel as nib
 
 from config_loader import config
-from moco_main import VoxelMorphReg
-from monai.networks.blocks import Warp
+from moco_main import DenseRigidReg
 from skimage.exposure import match_histograms
 
 # -----------------------------
@@ -50,7 +55,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # -----------------------------
 def main(data_dir, ckpt_path):
     """
-    Run inference on all subjects/sessions and save corrected volumes + flows.
+    Run inference on all subjects/sessions in the dataset and save
+    motion-corrected 4D NIfTI volumes along with translation maps (Tx, Ty).
     """
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -61,11 +67,9 @@ def main(data_dir, ckpt_path):
     # -----------------------------
     # Load model
     # -----------------------------
-    model = VoxelMorphReg.load_from_checkpoint(ckpt_path, map_location=device)
+    model = DenseRigidReg.load_from_checkpoint(ckpt_path, map_location=device)
     model = model.to(device)
     model.eval()
-
-    warp = Warp(mode="nearest", padding_mode="border").to(device)
 
     # -----------------------------
     # Detect subjects and files automatically
@@ -105,33 +109,26 @@ def main(data_dir, ckpt_path):
 
             # extract float data arrays
             ref_data = raw_img.get_fdata().astype(np.float32)
-            moving = moving_img.get_fdata().astype(np.float32)
-            fixed = fixed_img.get_fdata().astype(np.float32)
-            mask = mask_img.get_fdata().astype(np.float32)
+            moving_np = moving_img.get_fdata().astype(np.float32)
+            fixed_np = fixed_img.get_fdata().astype(np.float32)
+            mask_np = mask_img.get_fdata().astype(np.float32)
 
             # Add batch/channel dims
-            moving = torch.from_numpy(moving).unsqueeze(0).unsqueeze(0).to(device)
-            if fixed.ndim == 4:
-                fixed = torch.from_numpy(fixed).unsqueeze(0).unsqueeze(0).to(device)
-            else:
-                fixed = torch.from_numpy(fixed).unsqueeze(0).unsqueeze(0).to(device)
-            mask = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).to(device)
+            moving = torch.from_numpy(moving_np).unsqueeze(0).unsqueeze(0).to(device)
+            fixed = torch.from_numpy(fixed_np).unsqueeze(0).unsqueeze(0).to(device)
+            mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
 
             # -----------------------------
             # Run inference
             # -----------------------------
             start_time = time.time()
             with torch.no_grad():
-                warped_all, Tx, Ty = model(moving, fixed, mask)
-
-            elapsed = time.time() - start_time
-            timings.append(elapsed)
-            print(f"Inference completed in {elapsed:.2f} sec")
+                warped_all, Tx_all, Ty_all = model(moving, fixed, mask)
 
             # Convert to numpy
-            warped = warped_all.squeeze(0).squeeze(0).cpu().numpy()     # (H,W,D,T)
-            Tx = Tx.squeeze().cpu().numpy()                         # (1,1,D,T)
-            Ty = Ty.squeeze().cpu().numpy()                         # (1,1,D,T)
+            warped = warped_all.squeeze(0).squeeze(0).cpu().numpy()  # (H,W,D,T)
+            Tx = Tx_all.squeeze().cpu().numpy()  # (1,1,D,T)
+            Ty = Ty_all.squeeze().cpu().numpy()  # (1,1,D,T)
 
             # Histogram matching
             matched = np.zeros_like(warped)
@@ -149,8 +146,11 @@ def main(data_dir, ckpt_path):
             nib.save(nib.Nifti1Image(matched, affine, header=header), os.path.join(out_dir, f"moco_{prefix}_{suffix}.nii.gz"))
             nib.save(nib.Nifti1Image(Tx[np.newaxis, np.newaxis, ...], affine, header=header), os.path.join(out_dir, f"{prefix}_Tx.nii.gz"))
             nib.save(nib.Nifti1Image(Ty[np.newaxis, np.newaxis, ...], affine, header=header), os.path.join(out_dir, f"{prefix}_Ty.nii.gz"))
-
             print(f"Saved outputs to: {out_dir}")
+
+            elapsed = time.time() - start_time
+            timings.append(elapsed)
+            print(f"Inference completed in {elapsed:.2f} sec")
 
     # -----------------------------
     # Summary time
