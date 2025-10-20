@@ -1,5 +1,5 @@
 # Deep Learning Approaches for Motion Correction in Spinal Cord Diffusion MRI and Functional MRI
-This repository introduces **DenseRigidNet**, a DenseNet-based slice-wise regressor that estimates rigid in-plane translations (Tx, Ty) for motion correction.
+This repository introduces a DenseNet-based slice-wise regressor that estimates rigid in-plane translations (Tx, Ty) for motion correction.
 
 ## Overview
 1. **Generate motion-affected data** using `augmentation.py`  
