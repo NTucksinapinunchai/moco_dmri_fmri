@@ -19,10 +19,21 @@ This repository introduces a DenseNet-based slice-wise regressor that estimates 
 
 ## Dependencies
 The primary dependencies for this project are:
-*   [Spinal Cord Toolbox (SCT)](https://spinalcordtoolbox.com/): Required for the `preprocessing.py` script. Please ensure SCT is installed and its command-line tools are available in your PATH.
+*   [Spinal Cord Toolbox (SCT)](https://spinalcordtoolbox.com/): Required for the `preprocessing.py` script.
 *   Python 3.9
 *   PyTorch Lightning
 *   [MONAI](https://github.com/Project-MONAI/MONAI)
-*   nibabel
+*   NiBabel
 *   scikit-image
 *   PyYAML
+
+## Model Architecture and Training
+This project used the `DenseNet` model implemented in PyTorch Lightning (`moco_main.py`).
+
+*   **Backbone (`DenseNetRegressorSliceWise`)**: A DenseNet-based architecture that takes a pair of slices (moving and fixed) and predicts the required 2D translation (Tx, Ty) to align them. It processes the entire volume slice-by-slice.
+
+*   **Warping (`RigidWarp`)**: A module that applies the predicted slice-wise translations to the moving volume using a bilinear sampling grid.
+
+*   **Loss Function**: A composite loss function is used to guide the training:
+    *   **Similarity Loss**: A weighted combination of Global Normalized Cross-Correlation (GNCC), L2 (MSE), and L1 loss to maximize the similarity between the warped and fixed volumes within the spinal cord region.
+    *   **Smoothness Regularization**: Penalizes large translations and encourages smooth transitions of translation parameters between adjacent slices and time points.
