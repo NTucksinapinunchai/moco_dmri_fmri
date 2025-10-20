@@ -16,3 +16,13 @@ This repository introduces **DenseRigidNet**, a DenseNet-based slice-wise regres
 
 5. **Evaluate and test model performance** using `test_model.py`  
    → Apply the trained model to new data, correct motion, and export motion-corrected 4D volumes as well as Tx and Ty translation parameter.
+
+## Dependencies
+The primary dependencies for this project are:
+*   [Spinal Cord Toolbox (SCT)](https://spinalcordtoolbox.com/): Required for the `preprocessing.py` script. Please ensure SCT is installed and its command-line tools are available in your PATH.
+*   Python 3.9
+*   PyTorch Lightning
+*   [MONAI](https://github.com/Project-MONAI/MONAI)
+*   nibabel
+*   scikit-image
+*   PyYAML
