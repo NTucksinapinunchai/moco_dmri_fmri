@@ -216,12 +216,25 @@ def l1_loss(warped_all, fixed, mask):
 
 def rigid_smoothness(Tx, Ty, lam_mag=1e-5, lam_z=1e-5, lam_t=1e-5):
     """
-    Smoothness regularization along slice (z) and time (t).
+    Smoothness regularization along slice (z) and time (t),
+    with replicate padding only along z to include D=1 and D=last.
     """
-    def dz(t): return (t[..., 1:, :] - t[..., :-1, :]).abs().mean()
-    def dt(t): return (t[..., :, 1:] - t[..., :, :-1]).abs().mean()
+    # Pad along z so first/last slices are included in smoothness
+    Tx_pz = F.pad(Tx, (0, 0, 1, 1), mode="replicate")  # pad z-dim
+    Ty_pz = F.pad(Ty, (0, 0, 1, 1), mode="replicate")
+
+    # Differences along z (include first and last)
+    dz = (Tx_pz[..., 2:, :] - Tx_pz[..., :-2, :]).abs().mean() + \
+         (Ty_pz[..., 2:, :] - Ty_pz[..., :-2, :]).abs().mean()
+
+    # Differences along t (keep original)
+    dt = (Tx[..., :, 1:] - Tx[..., :, :-1]).abs().mean() + \
+         (Ty[..., :, 1:] - Ty[..., :, :-1]).abs().mean()
+
+    # Magnitude penalty
     mag = (Tx.pow(2).mean() + Ty.pow(2).mean())
-    return lam_mag * mag + lam_z * (dz(Tx) + dz(Ty)) + lam_t * (dt(Tx) + dt(Ty))
+
+    return lam_mag * mag + lam_z * dz + lam_t * dt
 
 # -----------------------------
 # Dense Block and Layer
@@ -486,9 +499,9 @@ if __name__ == "__main__":
     # -----------------------------
     # Training setup
     # -----------------------------
-    num_epochs = 100
+    num_epochs = 200
     batch_size = 1
-    lr = 1e-5
+    lr = 1e-4
     num_workers = 8
 
     # -----------------------------
@@ -534,7 +547,7 @@ if __name__ == "__main__":
     wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}")
 
     # If continue with the pretrained_ckpt, resume logs to the same wandb run
-    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}", id="pszc74k6", resume="must")
+    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_2}", id="p825uo4n", resume="must")
 
     wandb_config = wandb_logger.experiment.config
     wandb_config.update({
