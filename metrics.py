@@ -10,7 +10,7 @@ Features:
   using patterns defined in config.yaml.
 - Computes:
     • 4D RMSE (Root Mean Squared Error) per timepoint inside the mask
-    • 3D Dice coefficient between segmentations (before vs. after)
+    • SSIM (Structural Similarity Index)
     • fMRI-only metrics: temporal SNR (tSNR) and DVARS
 - Aggregates all subject/session metrics into a summary CSV
 
@@ -34,43 +34,51 @@ import nibabel as nib
 import torch
 torch.set_float32_matmul_precision("medium")
 
-from monai.metrics import DiceMetric
 from moco_main import normalize_volume
+from skimage.metrics import structural_similarity as ssim
 from config_loader import config
 
 # -----------------------------
 # Helper functions
 # -----------------------------
 def load_nifti(path):
-    """
-       Load a NIfTI image as numpy array.
-    """
+    """Load a NIfTI image as numpy array."""
     img = nib.load(path)
     data = img.get_fdata().astype(np.float32)
     return data, img.affine, img.header
 
 def to_tensor(arr, add_dims=True):
-    """
-        Convert a numpy array to a torch tensor with batch/channel dimensions.
-    """
+    """Convert numpy array to torch tensor with batch/channel dimensions."""
     t = torch.tensor(arr, dtype=torch.float32)
     if add_dims:
         t = t.unsqueeze(0).unsqueeze(0)  # (1,1,H,W,D)
     return t
 
 def compute_rmse(pred, target, mask):
-    """
-    Compute Root Mean Squared Error (RMSE) within a binary mask.
-    """
+    """Compute Root Mean Squared Error (RMSE) within a binary mask."""
     diff = (pred - target) ** 2
     masked = diff * mask
     denom = mask.sum()
     return torch.sqrt(masked.sum() / (denom + 1e-6)).item()
 
+def compute_ssim_3d(pred, target, mask):
+    """
+    Compute 3D SSIM between pred and target within a mask.
+    SSIM is computed slice-wise along z and averaged for stability.
+    """
+    pred = pred * (mask > 0)
+    target = target * (mask > 0)
+    nz = pred.shape[2]
+    ssim_vals = []
+    for z in range(nz):
+        ssim_val = ssim(pred[:, :, z], target[:, :, z],
+                        data_range=target.max() - target.min(),
+                        gaussian_weights=True, use_sample_covariance=False)
+        ssim_vals.append(ssim_val)
+    return float(np.mean(ssim_vals))
+
 def compute_tsnr(data, mask):
-    """
-    Compute temporal Signal-to-Noise Ratio (tSNR).
-    """
+    """Compute temporal Signal-to-Noise Ratio (tSNR)."""
     mean_t = np.mean(data, axis=-1)
     std_t = np.std(data, axis=-1)
     tsnr_map = np.divide(mean_t, std_t, out=np.zeros_like(mean_t), where=std_t > 0)
@@ -78,9 +86,7 @@ def compute_tsnr(data, mask):
     return tsnr_map, mean_tsnr
 
 def compute_dvars(data, mask):
-    """
-    Compute DVARS time series and mean value.
-    """
+    """Compute DVARS time series and mean value."""
     masked = data[mask > 0]
     norm_data = masked / np.mean(masked, axis=0, keepdims=True)
     diff = np.diff(norm_data, axis=1)
@@ -92,9 +98,7 @@ def compute_dvars(data, mask):
 # Main evaluation
 # -----------------------------
 def main(data_dir, mode):
-    """
-        Main evaluation routine for computing RMSE, Dice, tSNR, and DVARS.
-    """
+    """Main evaluation routine for computing RMSE, SSIM, tSNR, and DVARS."""
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
@@ -114,17 +118,12 @@ def main(data_dir, mode):
         for target in targets:
             subdir = os.path.join(target, patterns["subdir"])
             prefix = os.path.basename(target.rstrip("/"))
-
             print(f"\nProcessing {target}")
 
             raw_files = glob.glob(os.path.join(subdir, patterns["raw"]))
             moving_files = glob.glob(os.path.join(subdir, patterns["moving"]))
             warped_files = glob.glob(os.path.join(subdir, patterns["moco"]))
             mask_files = glob.glob(os.path.join(subdir, patterns["mask"]))
-
-            seg_r_files = glob.glob(os.path.join(subdir, "sub-*_seg.nii.gz"))
-            seg_m_files = glob.glob(os.path.join(subdir, "aug_*_seg.nii.gz"))
-            seg_w_files = glob.glob(os.path.join(subdir, "moco_*_seg.nii.gz"))
 
             if not (moving_files and raw_files and warped_files and mask_files):
                 print(f"Missing required files in {target}, skipping.")
@@ -137,54 +136,38 @@ def main(data_dir, mode):
             moving, _, _ = load_nifti(moving_files[0])
             warped, aff, hdr = load_nifti(warped_files[0])
             mask, _, _ = load_nifti(mask_files[0])
-
             mask_t = to_tensor(mask)
 
             # -----------------------------
-            # RMSE (root mean squared error across timepoints; per-t reference + normalization)
+            # RMSE / SSIM per timepoint
             # -----------------------------
             T = moving.shape[-1]
             rmse_before, rmse_after = [], []
+            ssim_before, ssim_after = [], []
 
             for t in range(T):
-                mov_t = to_tensor(moving[..., t])
-                war_t = to_tensor(warped[..., t])
-                raw_t = to_tensor(raw[..., t])
+                mov_t = moving[..., t]
+                war_t = warped[..., t]
+                raw_t = raw[..., t]
 
-                # percentile-normalize each volume inside the mask
-                mov_t_n = normalize_volume(mov_t, mask_t)
-                war_t_n = normalize_volume(war_t, mask_t)
-                raw_t_n = normalize_volume(raw_t, mask_t)
+                # Normalize inside the mask
+                mov_t_n = normalize_volume(to_tensor(mov_t), mask_t).squeeze().numpy()
+                war_t_n = normalize_volume(to_tensor(war_t), mask_t).squeeze().numpy()
+                raw_t_n = normalize_volume(to_tensor(raw_t), mask_t).squeeze().numpy()
 
-                rb = compute_rmse(mov_t_n, raw_t_n, mask_t)
-                ra = compute_rmse(war_t_n, raw_t_n, mask_t)
-                rmse_before.append(rb)
-                rmse_after.append(ra)
+                # ---- RMSE ----
+                rmse_before.append(compute_rmse(torch.tensor(mov_t_n), torch.tensor(raw_t_n), mask_t))
+                rmse_after.append(compute_rmse(torch.tensor(war_t_n), torch.tensor(raw_t_n), mask_t))
 
-            mean_rmse_before = np.mean(rmse_before)
-            mean_rmse_after = np.mean(rmse_after)
-            print(f"Mean RMSE before={mean_rmse_before:.4f}, after={mean_rmse_after:.4f}")
+                # ---- SSIM ----
+                ssim_before.append(compute_ssim_3d(mov_t_n, raw_t_n, mask))
+                ssim_after.append(compute_ssim_3d(war_t_n, raw_t_n, mask))
 
-            # -----------------------------
-            # DICE
-            # -----------------------------
-            dice_before, dice_after = np.nan, np.nan
-            if seg_m_files and seg_r_files and seg_w_files:
-                seg_r, _, _ = load_nifti(seg_r_files[0])
-                seg_m, _, _ = load_nifti(seg_m_files[0])
-                seg_w, _, _ = load_nifti(seg_w_files[0])
+            mean_rmse_before, mean_rmse_after = np.mean(rmse_before), np.mean(rmse_after)
+            mean_ssim_before, mean_ssim_after = np.mean(ssim_before), np.mean(ssim_after)
 
-                dice_metric = DiceMetric(include_background=True, reduction="mean")
-                seg_r_t = to_tensor(seg_r)
-                seg_m_t = to_tensor(seg_m)
-                seg_w_t = to_tensor(seg_w)
-
-                dice_before = dice_metric(seg_m_t, seg_r_t).item()
-                dice_after  = dice_metric(seg_w_t, seg_r_t).item()
-
-                print(f"DICE before={dice_before:.4f}, after={dice_after:.4f}")
-            else:
-                print("No segmentation files found, skipping DICE.")
+            print(f"RMSE  before={mean_rmse_before:.4f}, after={mean_rmse_after:.4f}")
+            print(f"SSIM  before={mean_ssim_before:.4f}, after={mean_ssim_after:.4f}")
 
             # -----------------------------
             # fMRI metrics (tSNR, DVARS)
@@ -195,22 +178,21 @@ def main(data_dir, mode):
                 _, tsnr_after  = compute_tsnr(warped, mask)
                 _, dvars_before = compute_dvars(moving, mask)
                 _, dvars_after  = compute_dvars(warped, mask)
-
-                print(f"tSNR before={tsnr_before:.2f}, after={tsnr_after:.2f}")
+                print(f"tSNR  before={tsnr_before:.2f}, after={tsnr_after:.2f}")
                 print(f"DVARS before={dvars_before:.4f}, after={dvars_after:.4f}")
             else:
                 tsnr_before = tsnr_after = np.nan
                 dvars_before = dvars_after = np.nan
 
             # -----------------------------
-            # Store subject metrics
+            # Store results
             # -----------------------------
             results.append({
                 "subject": prefix,
                 "mean_rmse_before": mean_rmse_before,
                 "mean_rmse_after": mean_rmse_after,
-                "dice_before": dice_before,
-                "dice_after": dice_after,
+                "mean_ssim_before": mean_ssim_before,
+                "mean_ssim_after": mean_ssim_after,
                 "tsnr_before": tsnr_before,
                 "tsnr_after": tsnr_after,
                 "dvars_before": dvars_before,
@@ -224,23 +206,19 @@ def main(data_dir, mode):
     print(f"\nSaving combined metrics summary → {summary_csv}")
 
     with open(summary_csv, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "subject",
-                "mean_rmse_before", "mean_rmse_after",
-                "dice_before", "dice_after",
-                "tsnr_before", "tsnr_after",
-                "dvars_before", "dvars_after",
-            ],
-        )
+        fieldnames = [
+            "subject",
+            "mean_rmse_before", "mean_rmse_after",
+            "mean_ssim_before", "mean_ssim_after",
+            "tsnr_before", "tsnr_after",
+            "dvars_before", "dvars_after",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+
         for r in results:
             for k, v in r.items():
                 if isinstance(v, (float, np.floating)):
-                    if np.isnan(v):
-                        r[k] = "nan"
-                    else:
-                        r[k] = f"{v:.4f}"
+                    r[k] = "nan" if np.isnan(v) else f"{v:.4f}"
 
         writer.writeheader()
         writer.writerows(results)
