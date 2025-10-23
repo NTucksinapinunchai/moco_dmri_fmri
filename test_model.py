@@ -42,7 +42,7 @@ import numpy as np
 import nibabel as nib
 
 from config_loader import config
-from moco_main import DenseRigidReg
+from moco_main import DenseRigidReg, RigidWarp
 from skimage.exposure import match_histograms
 
 # -----------------------------
@@ -70,6 +70,9 @@ def main(data_dir, ckpt_path):
     model = DenseRigidReg.load_from_checkpoint(ckpt_path, map_location=device)
     model = model.to(device)
     model.eval()
+
+    # Override warping for inference
+    model.warp = RigidWarp(mode="nearest")      # use nearest-neighbor interpolation for evaluation, Preserves original voxel intensities
 
     # -----------------------------
     # Detect subjects and files automatically
