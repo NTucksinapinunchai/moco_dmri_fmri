@@ -1,21 +1,21 @@
 # Deep Learning Approaches for Motion Correction in Spinal Cord Diffusion MRI and Functional MRI
-This repository introduces a DenseNet-based slice-wise regressor that estimates rigid in-plane translations (Tx, Ty) for motion correction.
+This repository introduces a DenseNet-based slice-wise regressor that estimates rigid in-plane translations (Tx, Ty) for motion correction in diffusion MRI (dMRI) and functional MRI (fMRI).
 
 ## Overview
-1. **Generate motion-affected data** using `augmentation.py`  
+1. **Generate motion-augmented data** using `augmentation.py`  
    → Simulate slice-wise rigid motion artifacts (only in-plane motion) in dMRI and fMRI data.
 
 2. **Preprocess the dataset** using `preprocessing.py`  
-   → Prepare mean dMRI/fMRI volumes, perform spinal cord segmentation and create mask along spinal cord via **Spinal Cord Toolbox (SCT)**.
+   → Prepare mean dMRI/fMRI volumes as the taeget volume, perform spinal cord segmentation and create mask along spinal cord via **Spinal Cord Toolbox (SCT)**.
 
-3. **Prepare datasets for training and validation** using `dataset_preparation.py`  
+3. **Prepare datasets for training** using `dataset_preparation.py`  
    → Organize the dataset structure and split into training, validation, (in .pt format) and testing sets.
 
 4. **Train the DenseNet-based deep learning model** using `moco_main.py`  
    → Learn rigid slice-wise translations (Tx, Ty) for motion correction across time.
 
 5. **Evaluate and test model performance** using `test_model.py`  
-   → Apply the trained model to new data, correct motion, and export motion-corrected 4D volumes as well as Tx and Ty translation parameter.
+   → Apply the trained model checkpoint to new data, correct motion, and export the 4D motion-corrected volumes as well as Tx and Ty translation parameter.
 
 ## Dependencies
 The primary dependencies for this project are:
@@ -26,46 +26,46 @@ The primary dependencies for this project are:
 *   NiBabel
 *   scikit-image
 *   PyYAML
-*   WANDB: to track and visualize the training
+*   Weights&Biases (wandb) — for training visualization and experiment tracking
 
 ## Model Architecture and Training
 This project used the `DenseNet` model implemented in PyTorch Lightning (`moco_main.py`).
 
-*   **Backbone (`DenseNetRegressorSliceWise`)**: A DenseNet-based architecture that takes a pair of slices (moving and fixed) and predicts the required 2D translation (Tx, Ty) to align them. It processes the entire volume slice-by-slice.
+*   **Backbone (`DenseNetRegressorSliceWise`)**: A DenseNet-based architecture that takes a pair of slices (motion-augmented and target) and predicts the required translation parameter (Tx, Ty) to align them. It processes the entire volume slice-by-slice.
 
-*   **Warping (`RigidWarp`)**: A module that applies the predicted slice-wise translations to the moving volume using a bilinear sampling grid.
+*   **Warping (`RigidWarp`)**: A module that converted Tx and Ty translation parameters into sampling grids and applied to the motion-augmented volumes using a bilinear interpolation.
 
 *   **Loss Function**: A composite loss function is used to guide the training:
-    *   **Similarity Loss**: A weighted combination of Global Normalized Cross-Correlation (GNCC) and L2 (MSE) loss to maximize the similarity between the warped and fixed volumes within the spinal cord region.
+    *   **Similarity Loss**: A weighted combination of Global Normalized Cross-Correlation (GNCC) and L2 (MSE) loss to maximize the similarity between the motion-corected and target volumes within the spinal cord region.
     *   **Smoothness Regularization**: Penalizes large translations and encourages smooth transitions of translation parameters between adjacent slices and time points.
  
 ## End-to-End Workflow
 The following steps guide you through the process, from data preparation to model inference. The scripts are designed to work with a **BIDS**-like directory structure.
 
 ### 1. Data Augmentation
-Simulate slice-wise rigid motion artifacts in your clean dMRI or fMRI data to create the "moving" volumes for training. The script automatically detects files `*dwi.nii.gz` for dMRI or `*bold.nii.gz` for fMRI.
+Simulate slice-wise rigid motion artifacts in your clean dMRI or fMRI data to create the "motion-augmented" volumes for training. The script automatically detects files `*dwi.nii.gz` for dMRI or `*bold.nii.gz` for fMRI.
 
 **Usage:**
 ```bash
 python augmentation.py /path/to/your_data <dmri|fmri>
 ```
-*   `/path/to/your_data`: The root directory containing subject folders.
-*   `mode`: Specify `dmri` or `fmri`.
+*   `/path/to/your_data`: The root directory containing subject folders
+*   `mode`: Specify `dmri` or `fmri`
 
 This generates an `aug_*.nii.gz` file for each subject.
 
 ### 2. Preprocessing with SCT
 Prepare the necessary reference (averaged or target) volumes and masks using the Spinal Cord Toolbox (SCT).
 
-*   **For dMRI**: Separates b0/dwi volumes, creates a mean dwi/b0 image, segments the cord, creates a mask, and generates a 4D target volume.
+*   **For dMRI**: Separates b0/dwi volumes, creates a mean dwi/b0 image, segments the cord, creates a mask.
 *   **For fMRI**: Computes a mean volume across time as a target image, segments the cord, and creates a mask.
 
 **Usage:**
 ```bash
 python preprocessing.py /path/to/your_data <dmri|fmri>
 ```
-*   `/path/to/your_data`: The root directory containing subject folders.
-*   `mode`: Specify `dmri` or `fmri`.
+*   `/path/to/your_data`: The root directory containing subject folders
+*   `mode`: Specify `dmri` or `fmri`
 
 ### 3. Dataset Preparation
 Convert the preprocessed NIfTI files into PyTorch tensors (`.pt`), split subjects into training (80%), validation (10%), and testing (10%) sets, and generate a `dataset.json` file to index the dataset. This organizes the data into a `prepared` subfolder.
@@ -74,9 +74,9 @@ Convert the preprocessed NIfTI files into PyTorch tensors (`.pt`), split subject
 ```bash
 python dataset_preparation.py /path/to/your_data <dmri|fmri>
 ```
-*   `/path/to/your_data`: The root directory containing subject folders.
-*   `mode`: Specify `dmri` or `fmri`.
-*   
+*   `/path/to/your_data`: The root directory containing subject folders
+*   `mode`: Specify `dmri` or `fmri`
+
 This creates a `prepared/<mode>_dataset` directory containing the structured dataset and the `dataset.json` index file.
 
 ### 4. Model Training
@@ -86,23 +86,23 @@ Train the DenseNet-based model using the prepared dataset. The script uses PyTor
 ```bash
 python moco_main.py /path/to/project_base /path/to/prepared_dataset <run_name1> <run_name2>(opt)
 ```
-*   `/path/to/project_base`: Base directory containing the script (.py) and trained_weights folder.
-*   `/path/to/prepared_dataset`: Path to the output directory from Step 3 (e.g., `/path/to/data/prepared/dmri_dataset`).
-*   `<run_name1>`: An identifier for this training run. The best model checkpoint will be saved as `<run_name1>.ckpt`.
-*   `<run_name2>`: If provided, in case of fine-tune from `<run_name1>`, it will be save under new model checkpoint `<run_name2>.ckpt`.
+*   `/path/to/project_base`: Base directory containing the script (.py) and trained_weights folder
+*   `/path/to/prepared_dataset`: Path to the output directory from Step 3 (e.g., `/path/to/data/prepared/dmri_dataset`)
+*   `<run_name1>`: An identifier for this training run. The best model checkpoint will be saved as `<run_name1>.ckpt`
+*   `<run_name2>`: If provided, in case of fine-tune from `<run_name1>`, it will be save under new model checkpoint `<run_name2>.ckpt`
 
 ### 5. Inference
-Apply a trained model checkpoint to a test dataset to perform motion correction. This script loads the test data, runs the model, and saves the motion-corrected 4D volume along with the predicted translation parameters (Tx and Ty).
+Apply a trained model checkpoint to a test dataset to perform motion correction. This script loads the test data, runs the model, and saves the 4D motion-corrected volume along with the predicted translation parameters (Tx and Ty).
 
 **Usage:**
 ```bash
 python test_model.py /path/to/testing /path/to/trained_weight.ckpt
 ```
-*   `/path/to/testing`: The path to the `testing` folder inside your prepared dataset directory.
-*   `/path/to/trained_weight.ckpt`: The full path to the trained model checkpoint file.
+*   `/path/to/testing`: The path to the `testing` folder inside your prepared dataset directory
+*   `/path/to/trained_weight.ckpt`: The full path to the trained model checkpoint file
 
 **Outputs:**
 For each test subject, the following files are saved in their respective `func` or `dwi` subdirectories:
-*   `moco_*.nii.gz`: The motion-corrected 4D NIfTI volume.
-*   `*_Tx.nii.gz`: The predicted translation parameters in the x-direction.
-*   `*_Ty.nii.gz`: The predicted translation parameters in the y-direction.
+*   `moco_*.nii.gz`: The motion-corrected 4D NIfTI volume
+*   `*_Tx.nii.gz`: The predicted translation parameters in the x-direction
+*   `*_Ty.nii.gz`: The predicted translation parameters in the y-direction
