@@ -25,13 +25,13 @@ Usage:
 ------
 In terminal/command line:
 
-    python moco_main.py /path/to/base path/to/data run1 [run2]
+    python moco_main.py /path/to/project_base path/to/prepared_dataset <run_name1> <run_name2>(opt)
 
 Arguments:
-    /path/to/base       : base directory containing the script and trained_weights
-    /path/to/data       : data directory depending on training dataset
-    run1                : identifier for this training run (checkpoint filename)
-    run2 (opt)          : if provided, fine-tune or continue from run1 but save under run2 name
+    /path/to/project_base           : base directory containing the script and trained_weights
+    /path/to/prepared_dataset       : data directory depending on training dataset
+    run_name1                            : identifier for this training run (checkpoint filename)
+    run_name2 (opt)                      : if provided, fine-tune or continue from run1 but save under run2 name
 
 """
 
@@ -138,14 +138,6 @@ def _get_fixed_t(fixed: torch.Tensor, t: int) -> torch.Tensor:
 # -----------------------------
 # Loss function (Similarity losses (LNCC + L2) and Rigid Smoothness)
 # -----------------------------
-def erode_mask(m, k=3):
-    """
-    Applies 3D binary erosion on a mask.
-    """
-    ker = torch.ones(1, 1, k, k, k, device=m.device, dtype=m.dtype)
-    pad = k // 2
-    return (F.conv3d(m.float(), ker, padding=pad) == k**3).float()
-
 def normalize_volume(x, mask, pmin=1, pmax=99, eps=1e-6):
     """
     Normalizes intensity inside mask to 0–1 range using percentile scaling.
@@ -166,7 +158,6 @@ def global_ncc_loss(a, b, mask, eps=1e-6):
     T_f = b.shape[-1] if b.ndim == 6 else 1
     T = min(T_w, T_f)
 
-    mask = erode_mask(mask, k=3)
     vals = []
     for t in range(T):
         a_t = normalize_volume(a[..., t], mask) * mask
@@ -190,7 +181,6 @@ def l2_loss(warped_all, fixed, mask):
     T_f = fixed.shape[-1] if fixed.ndim == 6 else 1
     T = min(T_w, T_f)
 
-    mask = erode_mask(mask, k=3)
     losses = []
     for t in range(T):
         warped_t = normalize_volume(warped_all[..., t], mask)
@@ -198,43 +188,17 @@ def l2_loss(warped_all, fixed, mask):
         losses.append(F.mse_loss(warped_t * mask, fixed_t * mask))
     return torch.stack(losses).mean()
 
-def l1_loss(warped_all, fixed, mask):
+
+def rigid_smoothness(Tx, Ty, lam_z=1e-4, lam_t=1e-5):
     """
-    Compute mean absolute error (L1 loss) across timepoints inside mask.
+    Slice-wise smoothness regularization along z-axis and timepoint.
+    Tx, Ty: (B,1,D,T)
     """
-    B, C, H, W, D, T_w = warped_all.shape
-    T_f = fixed.shape[-1] if fixed.ndim == 6 else 1
-    T = min(T_w, T_f)
-
-    mask = erode_mask(mask, k=3)
-    losses = []
-    for t in range(T):
-        warped_t = normalize_volume(warped_all[..., t], mask)
-        fixed_t  = normalize_volume(_get_fixed_t(fixed, t), mask)
-        losses.append(F.l1_loss(warped_t * mask, fixed_t * mask))
-    return torch.stack(losses).mean()
-
-def rigid_smoothness(Tx, Ty, lam_mag=1e-5, lam_z=1e-5, lam_t=1e-5):
-    """
-    Smoothness regularization along slice (z) and time (t),
-    with replicate padding only along z to include D=1 and D=last.
-    """
-    # Pad along z so first/last slices are included in smoothness
-    Tx_pz = F.pad(Tx, (0, 0, 1, 1), mode="replicate")  # pad z-dim
-    Ty_pz = F.pad(Ty, (0, 0, 1, 1), mode="replicate")
-
-    # Differences along z (include first and last)
-    dz = (Tx_pz[..., 2:, :] - Tx_pz[..., :-2, :]).abs().mean() + \
-         (Ty_pz[..., 2:, :] - Ty_pz[..., :-2, :]).abs().mean()
-
-    # Differences along t (keep original)
-    dt = (Tx[..., :, 1:] - Tx[..., :, :-1]).abs().mean() + \
-         (Ty[..., :, 1:] - Ty[..., :, :-1]).abs().mean()
-
-    # Magnitude penalty
-    mag = (Tx.pow(2).mean() + Ty.pow(2).mean())
-
-    return lam_mag * mag + lam_z * dz + lam_t * dt
+    dz_x = (Tx[..., 1:, :] - Tx[..., :-1, :]).abs().mean()
+    dz_y = (Ty[..., 1:, :] - Ty[..., :-1, :]).abs().mean()
+    dt_x = (Tx[..., :, 1:] - Tx[..., :, :-1]).abs().mean()
+    dt_y = (Ty[..., :, 1:] - Ty[..., :, :-1]).abs().mean()
+    return lam_z * (dz_x + dz_y) + lam_t * (dt_x + dt_y)
 
 # -----------------------------
 # Dense Block and Layer
@@ -316,6 +280,10 @@ class RigidWarp(nn.Module):
     """
     Apply rigid 2D transformation (Tx, Ty) slice-wise. Each slice is translated independently in-plane.
     """
+    def __init__(self, mode: str = "bilinear"):
+        super().__init__()
+        self.mode = mode
+
     def forward(self, vol, Tx, Ty):
         assert vol.ndim == 5, "vol must be (B,C,H,W,D)"
         B, C, H, W, D = vol.shape
@@ -352,7 +320,7 @@ class RigidWarp(nn.Module):
         # Warping
         warped_2d = F.grid_sample(
             vol_2d, grid_2d,
-            mode="bilinear", padding_mode="border", align_corners=False
+            mode=self.mode, padding_mode="border", align_corners=True
         )
         warped = warped_2d.view(B, D, C, H, W).permute(0, 2, 3, 4, 1).contiguous()  # (B,C,H,W,D)
         return warped
@@ -368,7 +336,7 @@ class DenseRigidReg(pl.LightningModule):
         super().__init__()
         self.lr = lr
         self.backbone = DenseNetRegressorSliceWise(in_channels=2, max_vox_shift=3.0)
-        self.warp = RigidWarp()
+        self.warp = RigidWarp(mode="bilinear")      # use bilinear interpolation for training, fewer artifacts and noise per volume
 
     def forward(self, moving, fixed, mask):
         """
@@ -417,10 +385,9 @@ class DenseRigidReg(pl.LightningModule):
         # Similarity (GNCC + masked L2 + masked L1)
         loss_lncc = global_ncc_loss(warped_all, fixed, mask)  # negative → lower is better
         loss_l2 = l2_loss(warped_all, fixed, mask)
-        loss_l1 = l1_loss(warped_all, fixed, mask)
 
         # Weighted combination
-        loss_sim = 0.2 * loss_l2 + 1.0 * loss_lncc + 0.3 * loss_l1
+        loss_sim = 0.2 * loss_l2 + 1.0 * loss_lncc
 
         # Rigid smoothness regularizer
         loss_reg = rigid_smoothness(Tx, Ty)
@@ -431,9 +398,8 @@ class DenseRigidReg(pl.LightningModule):
         # Logging
         B = moving.size(0)
         self.log("train_loss", loss, prog_bar=True, batch_size=B)
-        self.log("train_lncc_loss", loss_lncc, batch_size=B)
+        self.log("train_gncc_loss", loss_lncc, batch_size=B)
         self.log("train_l2_loss", loss_l2, batch_size=B)
-        self.log("train_l1_loss", loss_l1, batch_size=B)
         self.log("train_rigid_reg", loss_reg, batch_size=B)
         torch.cuda.empty_cache()
         return loss
@@ -445,19 +411,15 @@ class DenseRigidReg(pl.LightningModule):
 
             loss_lncc = global_ncc_loss(warped_all, fixed, mask)  # negative → lower is better
             loss_l2 = l2_loss(warped_all, fixed, mask)
-            loss_l1 = l1_loss(warped_all, fixed, mask)
-
-            loss_sim = 0.2 * loss_l2 + 1.0 * loss_lncc + 0.3 * loss_l1
+            loss_sim = 0.2 * loss_l2 + 1.0 * loss_lncc
 
             loss_reg = rigid_smoothness(Tx, Ty)
-
             loss = loss_sim + loss_reg
 
             B = moving.size(0)
             self.log("val_loss", loss, prog_bar=True, batch_size=B)
-            self.log("val_lncc_loss", loss_lncc, batch_size=B)
+            self.log("val_gncc_loss", loss_lncc, batch_size=B)
             self.log("val_l2_loss", loss_l2, batch_size=B)
-            self.log("val_l1_loss", loss_l1, batch_size=B)
             self.log("val_rigid_reg", loss_reg, batch_size=B)
             torch.cuda.empty_cache()
             return loss
@@ -499,7 +461,7 @@ if __name__ == "__main__":
     # -----------------------------
     # Training setup
     # -----------------------------
-    num_epochs = 200
+    num_epochs = 100
     batch_size = 1
     lr = 1e-4
     num_workers = 8
@@ -543,7 +505,7 @@ if __name__ == "__main__":
     import wandb
     from pytorch_lightning.loggers import WandbLogger
 
-    wandb.login(key="ab48d9c3a5dee9883bcb676015f2487c1bc51f74")
+    wandb.login()
     wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}")
 
     # If continue with the pretrained_ckpt, resume logs to the same wandb run

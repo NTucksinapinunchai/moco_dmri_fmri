@@ -36,6 +36,7 @@ import sys
 import glob
 import time
 import torch
+
 torch.set_float32_matmul_precision("medium")
 
 import numpy as np
@@ -49,6 +50,7 @@ from skimage.exposure import match_histograms
 # Device
 # -----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # -----------------------------
 # Main inference
@@ -72,7 +74,7 @@ def main(data_dir, ckpt_path):
     model.eval()
 
     # Override warping for inference
-    model.warp = RigidWarp(mode="nearest")      # use nearest-neighbor interpolation for evaluation, Preserves original voxel intensities
+    model.warp = RigidWarp(mode="nearest")  # use nearest-neighbor interpolation for evaluation, Preserves original voxel intensities
 
     # -----------------------------
     # Detect subjects and files automatically
@@ -133,6 +135,18 @@ def main(data_dir, ckpt_path):
             Tx = Tx_all.squeeze().cpu().numpy()  # (1,1,D,T)
             Ty = Ty_all.squeeze().cpu().numpy()  # (1,1,D,T)
 
+            # -----------------------------
+            # Build 5D displacement field (H, W, D, T, 3)
+            # -----------------------------
+            H, W, D, T = warped.shape
+            disp_field = np.zeros((H, W, D, T, 3), dtype=np.float32)
+
+            for t in range(T):
+                for d in range(D):
+                    disp_field[..., d, t, 0] = Tx[d, t]  # x-direction
+                    disp_field[..., d, t, 1] = Ty[d, t]  # y-direction
+                    disp_field[..., d, t, 2] = 0.0  # z-direction
+
             # Histogram matching
             matched = np.zeros_like(warped)
             for t in range(warped.shape[-1]):
@@ -149,6 +163,7 @@ def main(data_dir, ckpt_path):
             nib.save(nib.Nifti1Image(matched, affine, header=header), os.path.join(out_dir, f"moco_{prefix}_{suffix}.nii.gz"))
             nib.save(nib.Nifti1Image(Tx[np.newaxis, np.newaxis, ...], affine, header=header), os.path.join(out_dir, f"{prefix}_Tx.nii.gz"))
             nib.save(nib.Nifti1Image(Ty[np.newaxis, np.newaxis, ...], affine, header=header), os.path.join(out_dir, f"{prefix}_Ty.nii.gz"))
+            nib.save(nib.Nifti1Image(disp_field, affine, header=header), os.path.join(out_dir, f"{prefix}_dispfield.nii.gz"))
             print(f"Saved outputs to: {out_dir}")
 
             elapsed = time.time() - start_time
@@ -174,6 +189,6 @@ if __name__ == "__main__":
         print("Usage: python test_model.py <data_dir> <trained_weight>")
         sys.exit(1)
 
-    data_dir = sys.argv[1]          # path to testing dataset
-    ckpt_path = sys.argv[2]         # full path to .ckpt file (trained-weight)
+    data_dir = sys.argv[1]  # path to testing dataset
+    ckpt_path = sys.argv[2]  # full path to .ckpt file (trained-weight)
     main(data_dir, ckpt_path)
