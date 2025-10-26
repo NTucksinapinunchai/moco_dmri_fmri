@@ -188,15 +188,15 @@ def main(data_dir, mode):
             # Store results
             # -----------------------------
             results.append({
-                "subject": prefix,
-                "mean_rmse_before": mean_rmse_before,
-                "mean_rmse_after": mean_rmse_after,
-                "mean_ssim_before": mean_ssim_before,
-                "mean_ssim_after": mean_ssim_after,
-                "tsnr_before": tsnr_before,
-                "tsnr_after": tsnr_after,
-                "dvars_before": dvars_before,
-                "dvars_after": dvars_after,
+                "SUBJECT": prefix,
+                "RMSE_before": mean_rmse_before,
+                "RMSE_after": mean_rmse_after,
+                "SSIM_before": mean_ssim_before,
+                "SSIM_after": mean_ssim_after,
+                "tSNR_before": tsnr_before,
+                "tSNR_after": tsnr_after,
+                "DVARS_before": dvars_before,
+                "DVARS_after": dvars_after,
             })
 
     # -----------------------------
@@ -207,11 +207,11 @@ def main(data_dir, mode):
 
     with open(summary_csv, "w", newline="") as f:
         fieldnames = [
-            "subject",
-            "mean_rmse_before", "mean_rmse_after",
-            "mean_ssim_before", "mean_ssim_after",
-            "tsnr_before", "tsnr_after",
-            "dvars_before", "dvars_after",
+            "SUBJECT",
+            "RMSE_before", "RMSE_after",
+            "SSIM_before", "SSIM_after",
+            "tSNR_before", "tSNR_after",
+            "DVARS_before", "DVARS_after",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
 
