@@ -279,7 +279,7 @@ class RigidWarp(nn.Module):
     """
     Apply rigid 2D transformation (Tx, Ty) slice-wise. Each slice is translated independently in-plane.
     """
-    def __init__(self, mode: str = "nearest"):
+    def __init__(self, mode: str = "bilinear"):
         super().__init__()
         self.mode = mode
 
@@ -335,7 +335,7 @@ class DenseRigidReg(pl.LightningModule):
         super().__init__()
         self.lr = lr
         self.backbone = DenseNetRegressorSliceWise(in_channels=2, max_vox_shift=3.0)
-        self.warp = RigidWarp(mode="bilinear")      # use bilinear interpolation for training, fewer artifacts and noise per volume
+        self.warp = RigidWarp(mode="nearest")
 
     def forward(self, moving, fixed, mask):
         """

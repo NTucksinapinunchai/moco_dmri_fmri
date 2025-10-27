@@ -74,7 +74,7 @@ def main(data_dir, ckpt_path):
     model.eval()
 
     # Override warping for inference
-    model.warp = RigidWarp(mode="nearest")  # use nearest-neighbor interpolation for evaluation, Preserves original voxel intensities
+    model.warp = RigidWarp(mode="nearest")
 
     # -----------------------------
     # Detect subjects and files automatically
