@@ -9,8 +9,8 @@ Features:
 - Automatically locates the moving, fixed, warped, mask, and segmentation files
   using patterns defined in config.yaml.
 - Computes:
-    • 4D RMSE (Root Mean Squared Error) per timepoint inside the mask
-    • SSIM (Structural Similarity Index)
+    • RMSE (Root Mean Squared Error) per timepoint inside the mask
+    • SSIM (Structural Similarity Index) inside the mask
     • fMRI-only metrics: temporal SNR (tSNR) and DVARS
 - Aggregates all subject/session metrics into a summary CSV
 
