@@ -103,6 +103,25 @@ python test_model.py /path/to/testing /path/to/trained_weight.ckpt
 
 **Outputs:**
 For each test subject, the following files are saved in their respective `func` or `dwi` subdirectories:
-*   `moco_*.nii.gz`: The motion-corrected 4D NIfTI volume
+*   `moco_*.nii.gz`: The 4D motion-corrected NIfTI volume
 *   `*_Tx.nii.gz`: The predicted translation parameters in the x-direction
 *   `*_Ty.nii.gz`: The predicted translation parameters in the y-direction
+
+### 6. Quantitative evaluation (optional)
+After motion correction, you can quantitatively evaluate the improvement in image quality using `metrics.py`.  
+This script automatically computes voxel-wise and temporal metrics before and after correction for both **dMRI** and **fMRI** datasets.
+- Computes the following metrics:
+  - **RMSE (Root Mean Squared Error)** — evaluates voxel-wise similarity
+  - **SSIM (Structural Similarity Index)** — measures 3D structural fidelity  
+  - **tSNR (temporal Signal-to-Noise Ratio)** — evaluates signal stability across time *(fMRI only)*  
+  - **DVARS (temporal derivative of RMS variance)** — quantifies temporal signal fluctuation *(fMRI only)*
+
+**Usage:**
+```bash
+python metrics.py /path/to/testing <dmri|fmri>
+```
+*   `/path/to/testing`: The path to the `testing` folder inside your prepared dataset directory (same as in 5.Inference)
+*   `mode`: Specify `dmri` or `fmri`
+
+**Outputs:**
+A summary CSV file (`dmri_metrics.csv` or `fmri_metrics.csv`): the reported values for each subject are averaged across timepoints.
