@@ -188,7 +188,6 @@ def l2_loss(warped_all, fixed, mask):
         losses.append(F.mse_loss(warped_t * mask, fixed_t * mask))
     return torch.stack(losses).mean()
 
-
 def rigid_smoothness(Tx, Ty, lam_z=1e-4, lam_t=1e-5):
     """
     Slice-wise smoothness regularization along z-axis and timepoint.
@@ -280,7 +279,7 @@ class RigidWarp(nn.Module):
     """
     Apply rigid 2D transformation (Tx, Ty) slice-wise. Each slice is translated independently in-plane.
     """
-    def __init__(self, mode: str = "bilinear"):
+    def __init__(self, mode: str = "nearest"):
         super().__init__()
         self.mode = mode
 
