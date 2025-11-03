@@ -31,16 +31,19 @@ from scipy.ndimage import affine_transform
 # ---------------------------
 class RandSliceWiseAffine:
     """
-    Apply random slice-wise affine transform (rotation + shift) to a 3D volume.
+    Apply random slice-wise affine transform (shift) to a 3D volume.
+    - not all timepoints have motion
+    - not all slices move when timepoint has motion
     """
-    def __init__(self, max_shift=2, prob=1.0, axis=2):
+    def __init__(self, max_shift=2, p_frame=0.6, p_slice=0.4, axis=2):
         self.max_shift = max_shift
-        self.prob = prob
+        self.p_frame = p_frame  # probability this volume has motion
+        self.p_slice = p_slice  # probability slice moves within moving volume
         self.axis = axis
 
     def __call__(self, vol: np.ndarray) -> np.ndarray:
         out = vol.copy()
-        if np.random.rand() > self.prob:
+        if np.random.rand() > self.p_frame:
             return out
 
         H, W, D = out.shape
@@ -49,20 +52,21 @@ class RandSliceWiseAffine:
             H, W, D = out.shape
 
         for idx in range(D):
-            tx = np.random.uniform(-self.max_shift, self.max_shift)
-            ty = np.random.uniform(-self.max_shift, self.max_shift)
+            if np.random.rand() < self.p_slice:
+                # Apply motion to this slice
+                tx = np.random.uniform(-self.max_shift, self.max_shift)
+                ty = np.random.uniform(-self.max_shift, self.max_shift)
 
-            # Identity transform (no rotation, only shift)
-            matrix = np.eye(2)
-            offset = np.array([tx, ty])
+                out[:, :, idx] = affine_transform(
+                    out[:, :, idx],
+                    np.eye(2),
+                    offset=(tx, ty),
+                    order=0, mode="nearest"
+                )
+            else:
+                # Slice stays still
+                pass
 
-            out[:, :, idx] = affine_transform(
-                out[:, :, idx], matrix,
-                offset=offset,
-                order=0, mode="nearest"
-            )
-
-            # move axis back
         if self.axis != 2:
             out = np.moveaxis(out, -1, self.axis)
 
@@ -99,7 +103,7 @@ def main(data_dir, mode):
     """
     Perform augmentation for all subjects in dataset directory (dmri or fmri).
     """
-    slicewise_tf = RandSliceWiseAffine(max_shift=2, prob=1.0, axis=2)
+    slicewise_tf = RandSliceWiseAffine(max_shift=2, p_frame=0.6, p_slice=0.6, axis=2)
     subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
 
     patterns = config[mode]
