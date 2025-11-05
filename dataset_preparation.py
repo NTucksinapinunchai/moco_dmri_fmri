@@ -88,7 +88,7 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
             os.makedirs(out_folder, exist_ok=True)
 
             if split_name in ["training", "validation"]:
-                # --- Convert and save .pt ---
+                # Convert and save .pt
                 moving, affine = load_as_tensor(moving_path, add_channel=True)
                 fixed, _ = load_as_tensor(fixed_path, add_channel=True)
                 mask, _ = load_as_tensor(mask_path, add_channel=True)
@@ -101,7 +101,7 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
                 entries.append({"data": rel_path})
 
             elif split_name == "testing":
-                # --- Only copy NIfTIs, no .pt ---
+                # Only copy NIfTIs, no .pt
                 for src in [moving_path, fixed_path, mask_path]:
                     if src and os.path.exists(src):
                         shutil.copy2(src, out_folder)
@@ -111,7 +111,7 @@ def build_entries(subject_list, split_name, base_dir, target_dir, mode):
                     shutil.copy2(extra_files[0], out_folder)
                     print(f"Copied extra test file: {extra_files[0]}")
 
-                # --- dMRI: also copy bval/bvec if they exist ---
+                # dMRI: also copy bval/bvec if they exist
                 if mode == "dmri":
                     bval_files = glob(os.path.join(data_folder, "*.bval"))
                     bvec_files = glob(os.path.join(data_folder, "*.bvec"))

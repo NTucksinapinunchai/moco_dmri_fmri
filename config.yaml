@@ -12,7 +12,7 @@
 dmri:
   raw: "sub-*_dwi.nii.gz"
   moving: "aug_*_dwi.nii.gz"
-  fixed: "dup_*_dwi.nii.gz"
+  fixed: "dup_*_fixed.nii.gz"
   mask: "mask_*.nii.gz"
   moco: "moco_*_dwi.nii.gz"
   subdir: "dwi"

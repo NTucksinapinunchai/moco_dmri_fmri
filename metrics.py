@@ -174,15 +174,17 @@ def main(data_dir, mode):
             # -----------------------------
             if mode == "fmri":
                 print("Computing tSNR and DVARS ...")
-                _, tsnr_before = compute_tsnr(moving, mask)
-                _, tsnr_after  = compute_tsnr(warped, mask)
-                _, dvars_before = compute_dvars(moving, mask)
-                _, dvars_after  = compute_dvars(warped, mask)
-                print(f"tSNR  before={tsnr_before:.2f}, after={tsnr_after:.2f}")
-                print(f"DVARS before={dvars_before:.4f}, after={dvars_after:.4f}")
+                _, tsnr_raw = compute_tsnr(raw, mask)
+                _, tsnr_mov = compute_tsnr(moving, mask)
+                _, tsnr_moco  = compute_tsnr(warped, mask)
+                _, dvars_raw = compute_dvars(raw, mask)
+                _, dvars_mov = compute_dvars(moving, mask)
+                _, dvars_moco  = compute_dvars(warped, mask)
+                print(f"tSNR  raw={tsnr_raw:.2f}, mov={tsnr_mov:.2f}, moco={tsnr_moco:.2f}")
+                print(f"DVARS raw={dvars_raw:.4f}, mov={dvars_mov:.2f}, moco={dvars_moco:.4f}")
             else:
-                tsnr_before = tsnr_after = np.nan
-                dvars_before = dvars_after = np.nan
+                tsnr_raw = tsnr_mov = tsnr_moco = np.nan
+                dvars_raw = dvars_mov = dvars_moco = np.nan
 
             # -----------------------------
             # Store results
@@ -193,10 +195,12 @@ def main(data_dir, mode):
                 "RMSE_after": mean_rmse_after,
                 "SSIM_before": mean_ssim_before,
                 "SSIM_after": mean_ssim_after,
-                "tSNR_before": tsnr_before,
-                "tSNR_after": tsnr_after,
-                "DVARS_before": dvars_before,
-                "DVARS_after": dvars_after,
+                "tSNR_raw": tsnr_raw,
+                "tSNR_mov": tsnr_mov,
+                "tSNR_moco": tsnr_moco,
+                "DVARS_raw": dvars_raw,
+                "DVARS_mov": dvars_mov,
+                "DVARS_moco": dvars_moco
             })
 
     # -----------------------------
@@ -210,8 +214,8 @@ def main(data_dir, mode):
             "SUBJECT",
             "RMSE_before", "RMSE_after",
             "SSIM_before", "SSIM_after",
-            "tSNR_before", "tSNR_after",
-            "DVARS_before", "DVARS_after",
+            "tSNR_raw", "tSNR_mov", "tSNR_moco",
+            "DVARS_raw", "DVARS_mov", "DVARS_moco"
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
 

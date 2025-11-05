@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Augmentation script to simulate motion artifacts in dMRI and fMRI data via slice-wise affine transformsใ
+Augmentation script to simulate motion artifacts in dMRI and fMRI data by applying slice-wise affine transformations.
 
-- Automatically detects dMRI (*dwi.nii.gz) and fMRI (*bold.nii.gz) data following BIDS format.
-- Performs slice-wise transformations (x–y translation).
-- Can handle both dMRI and fMRI; user specifies which mode.
+- Slice-wise in-plane translations (x-y motion)
+- Compatible with both dMRI and fMRI (user specifies mode)
+- Motion realism controls:
+    - Case-level probability: some subjects have no motion
+    - Timepoint-level probability: only some volumes include motion
+    - Slice-level probability: only a subset of slices move within a moving volume
+- Preserves anatomical integrity while introducing controlled synthetic motion
 
 Usage:
 ------
@@ -32,20 +36,32 @@ from scipy.ndimage import affine_transform
 class RandSliceWiseAffine:
     """
     Apply random slice-wise affine transform (shift) to a 3D volume.
-    - not all timepoints have motion
-    - not all slices move when timepoint has motion
+    - p_case: probability dataset has any motion
+    - p_frame: probability timepoint has motion
+    - p_slice: probability slice moves in a moving timepoint
     """
-    def __init__(self, max_shift=2, p_frame=0.6, p_slice=0.4, axis=2):
+    def __init__(self, max_shift=2,  p_case=0.9, p_frame=0.6, p_slice=0.4, axis=2):
         self.max_shift = max_shift
+        self.p_case = p_case
         self.p_frame = p_frame  # probability this volume has motion
         self.p_slice = p_slice  # probability slice moves within moving volume
         self.axis = axis
 
+        # case-level decision (fixed for one augmented run)
+        self.case_has_motion = (np.random.rand() < self.p_case)
+
     def __call__(self, vol: np.ndarray) -> np.ndarray:
         out = vol.copy()
+
+        # If this case has NO motion at all
+        if not self.case_has_motion:
+            return out
+
+        # Now apply per-frame decision
         if np.random.rand() > self.p_frame:
             return out
 
+        # Frame has motion → slice selections
         H, W, D = out.shape
         if self.axis != 2:
             out = np.moveaxis(out, self.axis, -1)
@@ -63,9 +79,6 @@ class RandSliceWiseAffine:
                     offset=(tx, ty),
                     order=0, mode="nearest"
                 )
-            else:
-                # Slice stays still
-                pass
 
         if self.axis != 2:
             out = np.moveaxis(out, -1, self.axis)
@@ -103,7 +116,7 @@ def main(data_dir, mode):
     """
     Perform augmentation for all subjects in dataset directory (dmri or fmri).
     """
-    slicewise_tf = RandSliceWiseAffine(max_shift=2, p_frame=0.6, p_slice=0.6, axis=2)
+    slicewise_tf = RandSliceWiseAffine(max_shift=2, p_case=0.8, p_frame=0.8, p_slice=0.6, axis=2)
     subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
 
     patterns = config[mode]
