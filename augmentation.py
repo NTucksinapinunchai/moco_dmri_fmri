@@ -40,14 +40,16 @@ class RandSliceWiseAffine:
     - p_frame: probability timepoint has motion
     - p_slice: probability slice moves in a moving timepoint
     """
-    def __init__(self, max_shift=2,  p_case=0.9, p_frame=0.6, p_slice=0.4, axis=2):
+    def __init__(self, max_shift=2, p_case=0.9, p_frame=0.6, p_slice=0.4, axis=2):
         self.max_shift = max_shift
         self.p_case = p_case
-        self.p_frame = p_frame  # probability this volume has motion
-        self.p_slice = p_slice  # probability slice moves within moving volume
+        self.p_frame = p_frame
+        self.p_slice = p_slice
         self.axis = axis
+        self.case_has_motion = True  # placeholder; set per case
 
-        # case-level decision (fixed for one augmented run)
+    def new_case(self):
+        """Resample whether THIS case has any motion."""
         self.case_has_motion = (np.random.rand() < self.p_case)
 
     def __call__(self, vol: np.ndarray) -> np.ndarray:
@@ -57,32 +59,25 @@ class RandSliceWiseAffine:
         if not self.case_has_motion:
             return out
 
-        # Now apply per-frame decision
+        # Per-frame decision
         if np.random.rand() > self.p_frame:
             return out
 
         # Frame has motion → slice selections
-        H, W, D = out.shape
         if self.axis != 2:
             out = np.moveaxis(out, self.axis, -1)
-            H, W, D = out.shape
 
-        for idx in range(D):
+        H, W, D = out.shape
+        for d in range(D):
             if np.random.rand() < self.p_slice:
-                # Apply motion to this slice
                 tx = np.random.uniform(-self.max_shift, self.max_shift)
                 ty = np.random.uniform(-self.max_shift, self.max_shift)
-
-                out[:, :, idx] = affine_transform(
-                    out[:, :, idx],
-                    np.eye(2),
-                    offset=(tx, ty),
-                    order=0, mode="nearest"
+                out[:, :, d] = affine_transform(
+                    out[:, :, d], np.eye(2), offset=(tx, ty), order=0, mode="nearest"
                 )
 
         if self.axis != 2:
             out = np.moveaxis(out, -1, self.axis)
-
         return out
 
 # ---------------------------
@@ -95,14 +90,13 @@ def augment_data(input_img, output_img, slicewise_tf):
     print(f"Augmenting: {input_img}")
     img = nib.load(input_img)
     data = img.get_fdata().astype(np.float32)
+    slicewise_tf.new_case()
     H, W, D, T = data.shape
     print("Input shape:", data.shape)
 
     aug_data = np.zeros_like(data)
     for t in range(T):
-        vol = data[:, :, :, t]
-        aug_vol = slicewise_tf(vol)
-        aug_data[:, :, :, t] = aug_vol
+        aug_data[:, :, :, t] = slicewise_tf(data[:, :, :, t])
         print(f"Augmented volume {t + 1}/{T}")
 
     aug_img = nib.Nifti1Image(aug_data, img.affine, img.header)
@@ -116,7 +110,7 @@ def main(data_dir, mode):
     """
     Perform augmentation for all subjects in dataset directory (dmri or fmri).
     """
-    slicewise_tf = RandSliceWiseAffine(max_shift=2, p_case=0.8, p_frame=0.8, p_slice=0.6, axis=2)
+    slicewise_tf = RandSliceWiseAffine(max_shift=2, p_case=0.8, p_frame=0.8, p_slice=0.8, axis=2)
     subfolders = sorted([f.path for f in os.scandir(data_dir) if f.is_dir()])
 
     patterns = config[mode]
