@@ -131,6 +131,9 @@ def main(data_dir, ckpt_path):
             Tx = Tx_all.squeeze().cpu().numpy()
             Ty = Ty_all.squeeze().cpu().numpy()
 
+            # -----------------------------------
+            # restores fine structural detail
+            # -----------------------------------
             import cv2
             H, W, D, T = warped.shape
             sharpened = np.copy(warped)
@@ -144,14 +147,17 @@ def main(data_dir, ckpt_path):
                         sharpened[..., d, t] = img_warped
                         continue
 
-                    raw_smooth = cv2.GaussianBlur(img_raw, (0, 0), 0.6)     # 0.6 for dmri, 0.5 for fmri
+                    # Extract high-frequency texture
+                    raw_smooth = cv2.GaussianBlur(img_raw, (0, 0), 0.6)
                     texture = img_raw - raw_smooth
+
+                    # Re-inject texture to restore sharpness
                     out = img_warped + 1.3 * texture
                     lo, hi = np.percentile(img_raw[mask_slice > 0], [0.5, 99.5])
                     out = np.clip(out, lo, hi)
-
                     sharpened[..., d, t] = out
 
+            # Preserve outside-mask voxels
             sharpened[mask_np == 0] = ref_data[mask_np == 0]
 
             # # -----------------------------
