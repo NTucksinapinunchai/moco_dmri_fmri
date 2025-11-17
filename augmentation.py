@@ -131,8 +131,8 @@ def main(data_dir, mode):
             input_img = nii_files[0]
 
             # construct prefix
-            root = os.path.basename(input_img)
-            parts = root.split("_")
+            fname = os.path.basename(input_img)
+            parts = fname.split("_")
             if len(parts) > 1 and parts[1].startswith("ses-"):
                 prefix = "_".join(parts[:2])
             else:

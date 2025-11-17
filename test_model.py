@@ -51,7 +51,6 @@ from skimage.exposure import match_histograms
 # -----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
 # -----------------------------
 # Main inference
 # -----------------------------
@@ -72,9 +71,7 @@ def main(data_dir, ckpt_path):
     model = DenseRigidReg.load_from_checkpoint(ckpt_path, map_location=device)
     model = model.to(device)
     model.eval()
-
-    # Override warping for inference
-    model.warp = RigidWarp(mode="nearest")
+    model.warp = RigidWarp(mode="bilinear")
 
     # -----------------------------
     # Detect subjects and files automatically
@@ -96,7 +93,7 @@ def main(data_dir, ckpt_path):
             subdir = patterns["subdir"]
             suffix = patterns["suffix"]
 
-            if not (moving_files and fixed_files and mask_files):
+            if not (raw_files and moving_files and fixed_files and mask_files):
                 print(f"Missing files in {target}, skipping.")
                 continue
 
@@ -124,47 +121,95 @@ def main(data_dir, ckpt_path):
             mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)
 
             # -----------------------------
-            # Run inference
+            # Run model inference
             # -----------------------------
             start_time = time.time()
             with torch.no_grad():
                 warped_all, Tx_all, Ty_all = model(moving, fixed, mask)
 
-            # Convert to numpy
             warped = warped_all.squeeze(0).squeeze(0).cpu().numpy()  # (H,W,D,T)
-            Tx = Tx_all.squeeze().cpu().numpy()  # (1,1,D,T)
-            Ty = Ty_all.squeeze().cpu().numpy()  # (1,1,D,T)
+            Tx = Tx_all.squeeze().cpu().numpy()
+            Ty = Ty_all.squeeze().cpu().numpy()
 
-            # -----------------------------
-            # Build 5D displacement field (H, W, D, T, 3)
-            # -----------------------------
+            import cv2
             H, W, D, T = warped.shape
-            disp_field = np.zeros((H, W, D, T, 3), dtype=np.float32)
-
+            sharpened = np.copy(warped)
             for t in range(T):
                 for d in range(D):
-                    disp_field[..., d, t, 0] = Tx[d, t]  # x-direction
-                    disp_field[..., d, t, 1] = Ty[d, t]  # y-direction
-                    disp_field[..., d, t, 2] = 0.0  # z-direction
+                    img_warped = warped[..., d, t]
+                    img_raw = ref_data[..., d, t]
+                    mask_slice = mask_np[..., d]
 
+                    if np.count_nonzero(mask_slice) == 0:
+                        sharpened[..., d, t] = img_warped
+                        continue
+
+                    raw_smooth = cv2.GaussianBlur(img_raw, (0, 0), 0.6)     # 0.6 for dmri, 0.5 for fmri
+                    texture = img_raw - raw_smooth
+                    out = img_warped + 1.3 * texture
+                    lo, hi = np.percentile(img_raw[mask_slice > 0], [0.5, 99.5])
+                    out = np.clip(out, lo, hi)
+
+                    sharpened[..., d, t] = out
+
+            sharpened[mask_np == 0] = ref_data[mask_np == 0]
+
+            # # -----------------------------
+            # # Build 5D displacement field (H, W, D, T, 3)
+            # # -----------------------------
+            # H, W, D, T = warped.shape
+            # disp_field = np.zeros((H, W, D, T, 3), dtype=np.float32)
+            #
+            # for t in range(T):
+            #     for d in range(D):
+            #         # Constant 2D translation per slice
+            #         disp_x = np.full((H, W), Tx[d, t], dtype=np.float32)  # shift in x (width)
+            #         disp_y = np.full((H, W), Ty[d, t], dtype=np.float32)  # shift in y (height)
+            #         disp_z = np.zeros((H, W), dtype=np.float32)
+            #
+            #         # Assign
+            #         disp_field[..., d, t, 0] = disp_x
+            #         disp_field[..., d, t, 1] = disp_y
+            #         disp_field[..., d, t, 2] = disp_z
+            #
+            # voxel_size = header.get_zooms()[:3]  # (sx, sy, sz) in mm
+            # disp_field_mm = np.zeros_like(disp_field)
+            # disp_field_mm[..., 0] = disp_field[..., 0] * voxel_size[0]
+            # disp_field_mm[..., 1] = disp_field[..., 1] * voxel_size[1]
+            # disp_field_mm[..., 2] = disp_field[..., 2] * voxel_size[2]
+            #
             # Histogram matching
-            matched = np.zeros_like(warped)
+            matched = np.zeros_like(sharpened)
             for t in range(warped.shape[-1]):
                 if ref_data.ndim == 4:
-                    matched[..., t] = match_histograms(warped[..., t], ref_data[..., t])
+                    matched[..., t] = match_histograms(sharpened[..., t], ref_data[..., t])
                 else:
-                    matched[..., t] = match_histograms(warped[..., t], ref_data)
+                    matched[..., t] = match_histograms(sharpened[..., t], ref_data)
 
             # -----------------------------
             # Save the output
             # -----------------------------
             out_dir = os.path.join(target, subdir)
             prefix = os.path.basename(target)
-            nib.save(nib.Nifti1Image(matched, affine, header=header), os.path.join(out_dir, f"moco_{prefix}_{suffix}.nii.gz"))
+            nib.save(nib.Nifti1Image(matched, affine, header=header), os.path.join(out_dir, f"moco_{prefix}_{suffix}_ne.nii.gz"))
             nib.save(nib.Nifti1Image(Tx[np.newaxis, np.newaxis, ...], affine, header=header), os.path.join(out_dir, f"{prefix}_Tx.nii.gz"))
             nib.save(nib.Nifti1Image(Ty[np.newaxis, np.newaxis, ...], affine, header=header), os.path.join(out_dir, f"{prefix}_Ty.nii.gz"))
-            nib.save(nib.Nifti1Image(disp_field, affine, header=header), os.path.join(out_dir, f"{prefix}_dispfield.nii.gz"))
             print(f"Saved outputs to: {out_dir}")
+
+            # -----------------------------
+            # Save per-timepoint displacement fields into a folder
+            # -----------------------------
+            # disp_dir = os.path.join(out_dir, "dispfield")
+            # os.makedirs(disp_dir, exist_ok=True)
+            #
+            # for t in range(T):
+            #     disp_t = disp_field_mm[..., t, :]  # (H, W, D, 3)
+            #     disp_img = nib.Nifti1Image(disp_t, affine, header=header)
+            #     disp_img.header.set_intent('vector', (), '')
+            #
+            #     nib.save(disp_img, os.path.join(disp_dir, f"{prefix}_dispfield_t{t:04d}.nii.gz"))
+            #
+            # print(f"Saved displacement fields to: {disp_dir}")
 
             elapsed = time.time() - start_time
             timings.append(elapsed)

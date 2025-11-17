@@ -36,7 +36,7 @@ Arguments:
 """
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import gc
@@ -335,7 +335,7 @@ class DenseRigidReg(pl.LightningModule):
         super().__init__()
         self.lr = lr
         self.backbone = DenseNetRegressorSliceWise(in_channels=2, max_vox_shift=3.0)
-        self.warp = RigidWarp(mode="nearest")
+        self.warp = RigidWarp(mode="bilinear")
 
     def forward(self, moving, fixed, mask):
         """
@@ -460,7 +460,7 @@ if __name__ == "__main__":
     # -----------------------------
     # Training setup
     # -----------------------------
-    num_epochs = 100
+    num_epochs = 200
     batch_size = 1
     lr = 1e-4
     num_workers = 8
@@ -508,7 +508,7 @@ if __name__ == "__main__":
     wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_1}")
 
     # If continue with the pretrained_ckpt, resume logs to the same wandb run
-    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_2}", id="p825uo4n", resume="must")
+    # wandb_logger = WandbLogger(project="moco-dmri", name=f"{order_execution_2}", id="tia0y7s9", resume="must")
 
     wandb_config = wandb_logger.experiment.config
     wandb_config.update({
