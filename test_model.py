@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """
-Inference script used to generate the motion-corrected 4D volumes from DenseRigidDSRReg model.
+Inference script used to generate the motion-corrected 4D volumes from DenseRigid model.
 
 This script loads raw NIfTI files (moving, fixed, mask) directly and applies the trained
 DenseRigidDSRReg checkpoint to perform motion correction. It outputs the corrected
-4D volume as well as the translation parameters (Tx, Ty)
+4D volume as well as the displacement field and the translation parameters (Tx, Ty)
 
 Features:
 ---------
@@ -17,6 +17,7 @@ Features:
 Outputs:
 ---------
 - Motion-corrected 4D NIfTI (moco_*)
+- 5D displacement field (dispfield-all)
 - 2 rigid translation parameter: Tx, Ty  (each [D,T])
 - Timing statistics
 
@@ -71,7 +72,7 @@ def main(data_dir, ckpt_path):
     model = DenseRigidReg.load_from_checkpoint(ckpt_path, map_location=device)
     model = model.to(device)
     model.eval()
-    model.warp = RigidWarp(mode="bilinear")
+    model.warp = RigidWarp(mode="bilinear").to(device)
 
     # -----------------------------
     # Detect subjects and files automatically
@@ -125,11 +126,12 @@ def main(data_dir, ckpt_path):
             # -----------------------------
             start_time = time.time()
             with torch.no_grad():
-                warped_all, Tx_all, Ty_all = model(moving, fixed, mask)
+                warped_all, flow_all, Tx_all, Ty_all = model(moving, fixed, mask)
 
             warped = warped_all.squeeze(0).squeeze(0).cpu().numpy()  # (H,W,D,T)
-            Tx = Tx_all.squeeze().cpu().numpy()
-            Ty = Ty_all.squeeze().cpu().numpy()
+            flow = flow_all.squeeze(0).squeeze(0).cpu().numpy()
+            Tx = Tx_all.squeeze().cpu().numpy()  # (D,T), since B=1 and channel=1
+            Ty = Ty_all.squeeze().cpu().numpy()  # (D,T)
 
             # -----------------------------------
             # restores fine structural detail
@@ -157,65 +159,38 @@ def main(data_dir, ckpt_path):
                     out = np.clip(out, lo, hi)
                     sharpened[..., d, t] = out
 
-            # Preserve outside-mask voxels
-            sharpened[mask_np == 0] = ref_data[mask_np == 0]
-
-            # # -----------------------------
-            # # Build 5D displacement field (H, W, D, T, 3)
-            # # -----------------------------
-            # H, W, D, T = warped.shape
-            # disp_field = np.zeros((H, W, D, T, 3), dtype=np.float32)
-            #
-            # for t in range(T):
-            #     for d in range(D):
-            #         # Constant 2D translation per slice
-            #         disp_x = np.full((H, W), Tx[d, t], dtype=np.float32)  # shift in x (width)
-            #         disp_y = np.full((H, W), Ty[d, t], dtype=np.float32)  # shift in y (height)
-            #         disp_z = np.zeros((H, W), dtype=np.float32)
-            #
-            #         # Assign
-            #         disp_field[..., d, t, 0] = disp_x
-            #         disp_field[..., d, t, 1] = disp_y
-            #         disp_field[..., d, t, 2] = disp_z
-            #
-            # voxel_size = header.get_zooms()[:3]  # (sx, sy, sz) in mm
-            # disp_field_mm = np.zeros_like(disp_field)
-            # disp_field_mm[..., 0] = disp_field[..., 0] * voxel_size[0]
-            # disp_field_mm[..., 1] = disp_field[..., 1] * voxel_size[1]
-            # disp_field_mm[..., 2] = disp_field[..., 2] * voxel_size[2]
-            #
             # Histogram matching
-            matched = np.zeros_like(sharpened)
+            matched = np.zeros_like(warped)
             for t in range(warped.shape[-1]):
                 if ref_data.ndim == 4:
-                    matched[..., t] = match_histograms(sharpened[..., t], ref_data[..., t])
+                    matched[..., t] = match_histograms(warped[..., t], ref_data[..., t])
                 else:
-                    matched[..., t] = match_histograms(sharpened[..., t], ref_data)
+                    matched[..., t] = match_histograms(warped[..., t], ref_data)
+
+            # Build 5D displacement field (H, W, D, T, 3)
+            disp = np.moveaxis(flow, 0, -1).astype(np.float32)  # (H,W,D,T,3), voxel units
 
             # -----------------------------
             # Save the output
             # -----------------------------
             out_dir = os.path.join(target, subdir)
+            os.makedirs(out_dir, exist_ok=True)
             prefix = os.path.basename(target)
-            nib.save(nib.Nifti1Image(matched, affine, header=header), os.path.join(out_dir, f"moco_{prefix}_{suffix}_ne.nii.gz"))
-            nib.save(nib.Nifti1Image(Tx[np.newaxis, np.newaxis, ...], affine, header=header), os.path.join(out_dir, f"{prefix}_Tx.nii.gz"))
-            nib.save(nib.Nifti1Image(Ty[np.newaxis, np.newaxis, ...], affine, header=header), os.path.join(out_dir, f"{prefix}_Ty.nii.gz"))
-            print(f"Saved outputs to: {out_dir}")
 
-            # -----------------------------
-            # Save per-timepoint displacement fields into a folder
-            # -----------------------------
-            # disp_dir = os.path.join(out_dir, "dispfield")
-            # os.makedirs(disp_dir, exist_ok=True)
-            #
-            # for t in range(T):
-            #     disp_t = disp_field_mm[..., t, :]  # (H, W, D, 3)
-            #     disp_img = nib.Nifti1Image(disp_t, affine, header=header)
-            #     disp_img.header.set_intent('vector', (), '')
-            #
-            #     nib.save(disp_img, os.path.join(disp_dir, f"{prefix}_dispfield_t{t:04d}.nii.gz"))
-            #
-            # print(f"Saved displacement fields to: {disp_dir}")
+            # Motion-corrected 4D NIfTI
+            nib.save(nib.Nifti1Image(matched, affine, header=header), os.path.join(out_dir, f"moco_{prefix}_{suffix}.nii.gz"))
+
+            # Tx, Ty parameter maps saved as (1,1,D,T)
+            Tx_img = Tx[np.newaxis, np.newaxis, ...]
+            Ty_img = Ty[np.newaxis, np.newaxis, ...]
+            nib.save(nib.Nifti1Image(Tx_img, affine, header=header), os.path.join(out_dir, f"{prefix}_Tx.nii.gz"))
+            nib.save(nib.Nifti1Image(Ty_img, affine, header=header), os.path.join(out_dir, f"{prefix}_Ty.nii.gz"))
+
+            # 5D displacement field: (H,W,D,T,3) in mm, vector intent
+            disp5D_img = nib.Nifti1Image(disp, affine, header=header)
+            disp5D_img.header.set_intent("vector", (), "")
+            nib.save(disp5D_img, os.path.join(out_dir, f"{prefix}_dispfield-all.nii.gz"))
+            print(f"Saved outputs to: {out_dir}")
 
             elapsed = time.time() - start_time
             timings.append(elapsed)
