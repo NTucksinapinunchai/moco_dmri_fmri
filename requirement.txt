@@ -1,0 +1,32 @@
+# -------------------------
+# Core scientific packages
+# -------------------------
+numpy==2.0.2
+scipy==1.13.1
+scikit-image==0.24.0
+nibabel==5.3.2
+
+# -------------------------
+# Deep learning stack
+# -------------------------
+torch==2.5.0
+torchio==0.20.0
+torchvision==0.20.0
+lightning==2.5.4
+monai==1.5.0
+
+# -------------------------
+# Utilities
+# -------------------------
+pyyaml==6.0.2
+tqdm==4.67.1
+
+# -------------------------
+# Visualization / logging
+# -------------------------
+wandb==0.21.3
+
+# -------------------------
+# Image-processing (used in test_model.py)
+# -------------------------
+opencv-python==4.12.0.88

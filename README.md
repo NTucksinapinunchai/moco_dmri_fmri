@@ -28,6 +28,11 @@ The primary dependencies for this project are:
 *   PyYAML
 *   Weights&Biases (wandb) — for training visualization and experiment tracking
 
+You can use `requirement.txt` to install dependencies inside you conda environment:
+```bash
+pip install -r requirement.txt
+```
+
 ## Model Architecture and Training
 This project used the `DenseNet` model implemented in PyTorch Lightning (`moco_main.py`).
 
