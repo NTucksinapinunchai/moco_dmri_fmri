@@ -28,7 +28,7 @@ The primary dependencies for this project are:
 *   PyYAML
 *   Weights&Biases (wandb) — for training visualization and experiment tracking
 
-You can use `requirement.txt` to install dependencies inside you conda environment:
+You can use `requirement.txt` to install dependencies inside your conda environment:
 ```bash
 pip install -r requirement.txt
 ```
